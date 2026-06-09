@@ -4,11 +4,13 @@ import re
 import math
 import json
 import io
+import os
+import asyncio
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-import os
+from typing import Optional
 
 app = FastAPI(title="Supply Chain GRN Smart Entry System")
 
@@ -19,7 +21,6 @@ try:
         config = json.load(f)
 except FileNotFoundError:
     config = {}
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,59 +33,125 @@ app.add_middleware(
 sku_profiles = {}
 global_df = None
 
+# In-memory task status store for async uploads
+upload_tasks = {}
+
 class PredictRequest(BaseModel):
     sku_code: str
     input_price: float
 
-def build_sku_profiles(grn_df):
-    def get_implied_cf(text):
-        match = re.search(r'of\s+(\d+)', str(text), re.IGNORECASE)
-        return int(match.group(1)) if match else None
-        
-    grn_df['Implied_CF'] = grn_df['alternate_uom'].apply(get_implied_cf)
-    grn_df['Effective_CF'] = grn_df['Implied_CF'].fillna(grn_df['CF'])
-    
-    grn_df['Row_Base_Rate'] = grn_df['Price'] / grn_df['Effective_CF']
-    
+def build_sku_profiles_from_chunks(chunks):
+    """
+    Process CSV in streaming chunks and build SKU profiles incrementally.
+    Never holds the full DataFrame in memory — only the profiles dict grows.
+    """
     profiles = {}
     lower_mult = config.get("historical_data", {}).get("median_br_lower_multiplier", 0.2)
     upper_mult = config.get("historical_data", {}).get("median_br_upper_multiplier", 5.0)
 
-    for sku, group in grn_df.groupby('SKU Code'):
-        median_br = group['Row_Base_Rate'].median()
+    for chunk_idx, chunk in enumerate(chunks):
+        # Rename columns
+        rename_map = {"PO Purchase Rate": "Price", "invoice_date": "Date"}
+        chunk.rename(columns=rename_map, inplace=True)
         
-        valid_mask = (group['Row_Base_Rate'] >= lower_mult * median_br) & (group['Row_Base_Rate'] <= upper_mult * median_br)
-        if 'Date' in group.columns:
-            clean_group = group[valid_mask].sort_values('Date')
-        else:
-            clean_group = group[valid_mask]
-        
-        if clean_group.empty:
+        # Ensure required columns exist
+        if 'Price' not in chunk.columns or 'SKU Code' not in chunk.columns:
             continue
-            
-        latest_br = clean_group.iloc[-1]['Row_Base_Rate']
         
-        valid_uoms = {}
-        for uom, sub_group in clean_group.groupby('alternate_uom'):
-            valid_uoms[uom] = int(sub_group['Effective_CF'].mode()[0])
-            
-        profiles[sku] = {'latest_br': latest_br, 'valid_uoms': valid_uoms}
+        chunk['Price'] = pd.to_numeric(chunk['Price'], errors='coerce')
+        chunk.dropna(subset=['Price'], inplace=True)
         
-    return profiles
+        def get_implied_cf(text):
+            match = re.search(r'of\s+(\d+)', str(text), re.IGNORECASE)
+            return int(match.group(1)) if match else None
+        
+        if 'alternate_uom' in chunk.columns:
+            chunk['Implied_CF'] = chunk['alternate_uom'].apply(get_implied_cf)
+        else:
+            chunk['Implied_CF'] = None
+        
+        if 'CF' not in chunk.columns:
+            chunk['CF'] = 1.0
+        
+        chunk['Effective_CF'] = chunk['Implied_CF'].fillna(chunk['CF'])
+        chunk['Row_Base_Rate'] = chunk['Price'] / chunk['Effective_CF']
+        
+        # Group by SKU within this chunk
+        for sku, group in chunk.groupby('SKU Code'):
+            if sku not in profiles:
+                # Initialize with first occurrence
+                profiles[sku] = {'all_rates': [], 'date_rate_map': [], 'valid_uoms': {}}
+            
+            median_br = group['Row_Base_Rate'].median()
+            valid_mask = (group['Row_Base_Rate'] >= lower_mult * median_br) & (group['Row_Base_Rate'] <= upper_mult * median_br)
+            clean_group = group[valid_mask]
+            
+            if clean_group.empty:
+                continue
+            
+            # Collect valid rates for this SKU
+            for _, row in clean_group.iterrows():
+                rate = row['Row_Base_Rate']
+                uom = row.get('alternate_uom', '')
+                cf = int(row['Effective_CF'])
+                date = row.get('Date', None)
+                profiles[sku]['all_rates'].append(rate)
+                profiles[sku]['date_rate_map'].append((date, rate, uom, cf))
+    
+    # Finalize profiles from accumulated data
+    final_profiles = {}
+    for sku, data in profiles.items():
+        if not data['all_rates']:
+            continue
+        
+        rates = np.array(data['all_rates'])
+        median_br = float(np.median(rates))
+        
+        # Sort by date to find latest
+        sorted_by_date = sorted(data['date_rate_map'], key=lambda x: str(x[0]) if x[0] else '')
+        latest_br = sorted_by_date[-1][1] if sorted_by_date else median_br
+        
+        # Build valid_uoms
+        uom_cf_pairs = set()
+        for _, rate, uom, cf in sorted_by_date:
+            if uom:
+                uom_cf_pairs.add((uom, cf))
+        
+        valid_uoms = {pair[0]: pair[1] for pair in uom_cf_pairs}
+        final_profiles[sku] = {'latest_br': latest_br, 'valid_uoms': valid_uoms}
+    
+    return final_profiles
+
 
 @app.on_event("startup")
 def startup_event():
     global sku_profiles, global_df
-    data_file_path = config.get("data_file_path", "../GRN Data Final last 1 year UOM Adjusted.xlsx")
+    data_file_path = config.get("data_file_path", "../GRN Data Final last 1 year UOM Adjusted.csv")
     file_path = os.path.join(os.path.dirname(__file__), data_file_path)
+    
+    # Also try .xlsx as fallback
+    if not os.path.exists(file_path):
+        xlsx_path = file_path.replace('.csv', '.xlsx')
+        if os.path.exists(xlsx_path):
+            # Convert .xlsx to CSV first, then stream
+            print(f"Converting XLSX to CSV for streaming: {xlsx_path}")
+            df_temp = pd.read_excel(xlsx_path)
+            csv_path = file_path.replace('.csv', '_converted.csv')
+            df_temp.to_csv(csv_path, index=False)
+            file_path = csv_path
+    
     if os.path.exists(file_path):
-        df = pd.read_excel(file_path)
-        df.rename(columns={"PO Purchase Rate": "Price", "invoice_date": "Date"}, inplace=True)
-        global_df = df.copy()
-        sku_profiles = build_sku_profiles(df)
-        print(f"Loaded profiles for {len(sku_profiles)} SKUs.")
+        # Read first chunk to get column names and store a sample for template
+        first_chunk = pd.read_csv(file_path, nrows=5)
+        global_df = first_chunk.copy()
+        
+        # Stream the full file in chunks
+        chunks = pd.read_csv(file_path, chunksize=50000, low_memory=False)
+        sku_profiles = build_sku_profiles_from_chunks(chunks)
+        print(f"Loaded profiles for {len(sku_profiles)} SKUs (streaming mode).")
     else:
         print(f"Data file not found at {file_path}. Please place it in the configured path.")
+
 
 @app.post("/predict_uom")
 def predict_uom(req: PredictRequest):
@@ -128,6 +195,7 @@ def predict_uom(req: PredictRequest):
     best = candidates[0]
     
     return {"status": "success", "uom": best['uom'], "cf": best['cf']}
+
 
 @app.get("/export_outliers")
 def export_outliers():
@@ -198,7 +266,6 @@ def export_outliers():
         elif 'SKU Code' in outliers_df.columns:
             outliers_df = outliers_df.sort_values(by=['SKU Code'])
 
-    # Drop intermediate processing columns if you want a cleaner export
     cols_to_drop = ['Implied_CF', 'Effective_CF', 'Row_Base_Rate']
     outliers_df = outliers_df.drop(columns=[c for c in cols_to_drop if c in outliers_df.columns], errors='ignore')
 
@@ -211,34 +278,119 @@ def export_outliers():
         headers={"Content-Disposition": "attachment; filename=outliers_report.csv"}
     )
 
+
+async def process_upload_async(task_id: str, file_path: str):
+    """Process a large upload file in the background."""
+    try:
+        chunks = pd.read_csv(file_path, chunksize=50000, low_memory=False)
+        profiles = build_sku_profiles_from_chunks(chunks)
+        
+        # Update global state
+        global sku_profiles, global_df
+        sku_profiles = profiles
+        
+        # Read first chunk as sample for global_df
+        sample_df = pd.read_csv(file_path, nrows=5)
+        global_df = sample_df.copy()
+        
+        # Clean up temp file
+        try:
+            os.remove(file_path)
+        except:
+            pass
+        
+        upload_tasks[task_id] = {
+            "status": "success",
+            "message": f"Successfully loaded {len(sku_profiles)} SKUs from uploaded file."
+        }
+    except Exception as e:
+        upload_tasks[task_id] = {
+            "status": "error",
+            "message": f"Failed to process file: {str(e)}"
+        }
+
+
 @app.post("/upload_data")
 async def upload_data(file: UploadFile = File(...)):
-    global global_df, sku_profiles
+    global sku_profiles, global_df
+    
+    # Validate file extension
+    if not file.filename.endswith('.csv'):
+        return {"status": "error", "message": "Only .csv files are accepted. Please upload a CSV file."}
+    
     try:
+        # Read file content
         contents = await file.read()
-        df = pd.read_excel(io.BytesIO(contents))
-        df.rename(columns={"PO Purchase Rate": "Price", "invoice_date": "Date"}, inplace=True)
-        global_df = df.copy()
-        sku_profiles = build_sku_profiles(df)
-        return {"status": "success", "message": f"Successfully loaded {len(sku_profiles)} SKUs from uploaded file."}
+        
+        # Count rows without loading full file into memory
+        row_count = contents.count(b'\n') - 1  # subtract header
+        if row_count <= 0:
+            return {"status": "error", "message": "File appears to be empty or has no data rows."}
+        
+        # For files <= 100K rows, process inline
+        if row_count <= 100000:
+            csv_buffer = io.BytesIO(contents)
+            chunks = pd.read_csv(csv_buffer, chunksize=50000, low_memory=False)
+            sku_profiles = build_sku_profiles_from_chunks(chunks)
+            
+            # Load sample for global_df from original bytes (buffer may be consumed)
+            global_df = pd.read_csv(io.BytesIO(contents), nrows=5)
+            
+            return {
+                "status": "success",
+                "message": f"Successfully loaded {len(sku_profiles)} SKUs from {row_count:,} rows."
+            }
+        else:
+            # For large files (> 100K rows), use async processing
+            import uuid
+            import tempfile
+            
+            task_id = str(uuid.uuid4())
+            
+            # Save to temp file
+            temp_dir = tempfile.gettempdir()
+            temp_path = os.path.join(temp_dir, f"grn_upload_{task_id}.csv")
+            with open(temp_path, 'wb') as f:
+                f.write(contents)
+            
+            # Initialize task status
+            upload_tasks[task_id] = {"status": "processing", "message": f"Processing {row_count:,} rows in the background..."}
+            
+            # Launch background processing
+            asyncio.create_task(process_upload_async(task_id, temp_path))
+            
+            return {
+                "status": "accepted",
+                "task_id": task_id,
+                "message": f"File with {row_count:,} rows is being processed in the background."
+            }
+            
     except Exception as e:
         return {"status": "error", "message": f"Failed to process file: {str(e)}"}
 
+
+@app.get("/upload_status/{task_id}")
+def upload_status(task_id: str):
+    """Poll this endpoint to check the status of an async upload."""
+    task = upload_tasks.get(task_id)
+    if not task:
+        return {"status": "error", "message": "Task ID not found."}
+    return task
+
+
 @app.get("/download_template")
 def download_template():
+    """Download an empty CSV template with the same columns as the loaded data."""
     if global_df is None:
         return {"status": "error", "message": "Data not loaded yet."}
     
-    # Create an empty dataframe with the same columns
     template_df = pd.DataFrame(columns=global_df.columns)
     
-    excel_buffer = io.BytesIO()
-    with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-        template_df.to_excel(writer, index=False)
-        
-    excel_buffer.seek(0)
+    csv_buffer = io.StringIO()
+    template_df.to_csv(csv_buffer, index=False)
+    
     return Response(
-        content=excel_buffer.getvalue(),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=grn_template.xlsx"}
+        content=csv_buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=grn_template.csv"}
     )

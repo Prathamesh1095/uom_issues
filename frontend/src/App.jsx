@@ -4,6 +4,7 @@ import { AlertTriangle, CheckCircle2, Download, Upload, FileDown, FileUp } from 
 import clsx from 'clsx';
 
 const API_URL = import.meta.env.VITE_API_URL || 'https://uom-issues.onrender.com';
+const MAX_FILE_SIZE_MB = 50;
 
 function App() {
   const [skuCode, setSkuCode] = useState('');
@@ -25,7 +26,19 @@ function App() {
 
   const handleFileChange = (e) => {
     if (e.target.files && e.target.files[0]) {
-      setSelectedFile(e.target.files[0]);
+      const file = e.target.files[0];
+      
+      // File size validation
+      if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
+        setUploadMsg({ 
+          type: 'error', 
+          text: `File is too large (${(file.size / (1024 * 1024)).toFixed(1)} MB). Maximum allowed size is ${MAX_FILE_SIZE_MB} MB.` 
+        });
+        setSelectedFile(null);
+        return;
+      }
+      
+      setSelectedFile(file);
       setUploadMsg({ type: '', text: '' });
     }
   };
@@ -44,8 +57,13 @@ function App() {
           'Content-Type': 'multipart/form-data',
         },
       });
+      
       if (response.data.status === 'success') {
         setUploadMsg({ type: 'success', text: response.data.message });
+      } else if (response.data.status === 'accepted') {
+        // Async upload - start polling
+        setUploadMsg({ type: 'info', text: response.data.message });
+        pollUploadStatus(response.data.task_id);
       } else {
         setUploadMsg({ type: 'error', text: response.data.message });
       }
@@ -57,6 +75,38 @@ function App() {
     }
   };
 
+  const pollUploadStatus = async (taskId) => {
+    const maxAttempts = 60; // 5 minutes max (5s interval)
+    let attempts = 0;
+
+    const poll = async () => {
+      try {
+        const response = await axios.get(`${API_URL}/upload_status/${taskId}`);
+        const data = response.data;
+
+        if (data.status === 'success') {
+          setUploadMsg({ type: 'success', text: data.message });
+          return;
+        } else if (data.status === 'error') {
+          setUploadMsg({ type: 'error', text: data.message });
+          return;
+        } else if (data.status === 'processing') {
+          if (attempts < maxAttempts) {
+            attempts++;
+            setTimeout(poll, 5000); // Poll every 5 seconds
+          } else {
+            setUploadMsg({ type: 'error', text: 'Upload processing timed out after 5 minutes. Please try again with a smaller file.' });
+          }
+        }
+      } catch (error) {
+        console.error("Error polling upload status:", error);
+        setUploadMsg({ type: 'error', text: 'Failed to check upload progress. The server may still be processing your file.' });
+      }
+    };
+
+    poll();
+  };
+
   const handleDownloadTemplate = async () => {
     try {
       const response = await axios.get(`${API_URL}/download_template`, {
@@ -65,7 +115,7 @@ function App() {
       const url = window.URL.createObjectURL(new Blob([response.data]));
       const link = document.createElement('a');
       link.href = url;
-      link.setAttribute('download', 'grn_template.xlsx');
+      link.setAttribute('download', 'grn_template.csv');
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -191,10 +241,10 @@ function App() {
             <div className="flex items-center space-x-3 w-full max-w-md">
               <label className="flex-1 cursor-pointer bg-white border border-gray-300 hover:border-indigo-500 rounded-lg px-4 py-2 text-sm text-gray-600 transition-colors flex items-center justify-center">
                 <FileUp className="w-4 h-4 mr-2 text-gray-400" />
-                <span className="truncate">{selectedFile ? selectedFile.name : "Select XLSX File..."}</span>
+                <span className="truncate">{selectedFile ? selectedFile.name : "Select CSV File..."}</span>
                 <input 
                   type="file" 
-                  accept=".xlsx" 
+                  accept=".csv" 
                   className="hidden" 
                   onChange={handleFileChange} 
                 />
@@ -216,9 +266,13 @@ function App() {
           {uploadMsg.text && (
             <div className={clsx(
               "mt-3 p-3 rounded-lg text-sm font-medium animate-in fade-in flex items-center",
-              uploadMsg.type === 'success' ? "bg-green-50 text-green-700 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"
+              uploadMsg.type === 'success' ? "bg-green-50 text-green-700 border border-green-200" : 
+              uploadMsg.type === 'info' ? "bg-blue-50 text-blue-700 border border-blue-200" :
+              "bg-red-50 text-red-700 border border-red-200"
             )}>
-              {uploadMsg.type === 'success' ? <CheckCircle2 className="w-4 h-4 mr-2" /> : <AlertTriangle className="w-4 h-4 mr-2" />}
+              {uploadMsg.type === 'success' ? <CheckCircle2 className="w-4 h-4 mr-2" /> : 
+               uploadMsg.type === 'info' ? <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mr-2" /> :
+               <AlertTriangle className="w-4 h-4 mr-2" />}
               {uploadMsg.text}
             </div>
           )}

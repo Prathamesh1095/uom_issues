@@ -1,5 +1,5 @@
 {
-  "data_file_path": "../GRN Data Final last 1 year UOM Adjusted.xlsx",
+  "data_file_path": "../GRN Data Final last 1 year UOM Adjusted.csv",
   "historical_data": {
     "median_br_lower_multiplier": 0.6,
     "median_br_upper_multiplier": 3.0
