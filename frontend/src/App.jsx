@@ -3,7 +3,7 @@ import axios from 'axios';
 import { AlertTriangle, CheckCircle2, Download, Upload, FileDown, FileUp } from 'lucide-react';
 import clsx from 'clsx';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_URL = import.meta.env.VITE_API_URL || 'https://uom-issues.onrender.com';
 
 function App() {
   const [skuCode, setSkuCode] = useState('');
