@@ -9,17 +9,25 @@ const MAX_FILE_SIZE_MB = 50;
 function StartupOverlay({ show }) {
   const [logs, setLogs] = useState([]);
   const [complete, setComplete] = useState(false);
+  const [totalRows, setTotalRows] = useState(0);
+  const [processedRows, setProcessedRows] = useState(0);
   const logEndRef = useRef(null);
 
   useEffect(() => {
     if (!show) return;
 
+    let isCancelled = false;
+
     const poll = async () => {
       try {
         const res = await axios.get(`${API_URL}/startup_logs`);
+        if (isCancelled) return;
         setLogs(res.data.logs || []);
-        setComplete(res.data.complete);
-        return res.data.complete;
+        setTotalRows(res.data.total_rows || 0);
+        setProcessedRows(res.data.processed_rows || 0);
+        const done = res.data.complete;
+        setComplete(done);
+        return done;
       } catch {
         return false;
       }
@@ -35,7 +43,10 @@ function StartupOverlay({ show }) {
       }
     }, 2000);
 
-    return () => clearInterval(interval);
+    return () => {
+      isCancelled = true;
+      clearInterval(interval);
+    };
   }, [show]);
 
   useEffect(() => {
@@ -44,6 +55,10 @@ function StartupOverlay({ show }) {
 
   if (!show || complete) return null;
 
+  const percentage = totalRows > 0
+    ? Math.min(100, Math.round((processedRows / totalRows) * 100))
+    : 0;
+
   return (
     <div className="fixed inset-0 z-50 bg-gray-900 bg-opacity-95 flex items-center justify-center p-4">
       <div className="max-w-2xl w-full">
@@ -51,6 +66,31 @@ function StartupOverlay({ show }) {
           <div className="w-5 h-5 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin"></div>
           <h2 className="text-lg font-semibold text-white">Loading Data...</h2>
         </div>
+
+        {/* Progress bar */}
+        <div className="mb-4">
+          <div className="flex justify-between text-sm text-gray-300 mb-1.5">
+            <span className="font-medium">Processing historical data</span>
+            <span className="font-semibold text-indigo-400">{percentage}%</span>
+          </div>
+          <div className="w-full bg-gray-700 rounded-full h-3 overflow-hidden">
+            <div
+              className="h-3 rounded-full transition-all duration-500 ease-out bg-gradient-to-r from-indigo-500 to-indigo-700"
+              style={{ width: `${percentage}%` }}
+            />
+          </div>
+          <div className="flex justify-between mt-1">
+            <span className="text-xs text-gray-400">
+              {processedRows.toLocaleString()} / {totalRows.toLocaleString()} rows
+            </span>
+            {percentage > 0 && percentage < 100 && (
+              <span className="text-xs text-gray-400">
+                Initializing SKU profiles...
+              </span>
+            )}
+          </div>
+        </div>
+
         <div className="bg-gray-950 rounded-xl border border-gray-700 overflow-hidden shadow-2xl">
           <div className="flex items-center space-x-2 px-4 py-2 bg-gray-800 border-b border-gray-700">
             <Terminal className="w-4 h-4 text-gray-400" />

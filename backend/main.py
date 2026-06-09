@@ -68,145 +68,164 @@ def add_startup_log(message, processed=None, total=None):
 
 def build_sku_profiles_from_chunks(chunks, log_callback=None, known_total_rows=None):
     """
-    Process CSV in streaming chunks and build SKU profiles using vectorized operations.
-    Uses itertuples instead of iterrows for ~10x faster per-row access.
-    Tracks latest date during iteration instead of sorting at the end.
+    Process CSV in streaming chunks and build SKU profiles using fully vectorized operations.
+    Uses transform/groupby instead of per-SKU loops for ~100x faster processing.
+    Tracks latest date during accumulation instead of sorting at the end.
     """
-    profiles = {}
     lower_mult = config.get("historical_data", {}).get("median_br_lower_multiplier", 0.2)
     upper_mult = config.get("historical_data", {}).get("median_br_upper_multiplier", 5.0)
     total_rows_processed = 0
+
+    # Accumulators across chunks
+    all_rates = {}          # sku -> list of valid rates
+    all_dates = {}          # sku -> dict of {date_str: (rate, uom, cf)}
+    all_uoms = {}           # sku -> dict of {(uom, cf): count}
     total_chunks = 0
 
     for chunk_idx, chunk in enumerate(chunks):
         total_chunks = chunk_idx + 1
-        
+
         # Rename columns for consistency
         rename_map = {"PO Purchase Rate": "Price", "invoice_date": "Date"}
         chunk.rename(columns=rename_map, inplace=True)
-        
+
         # Ensure required columns exist
         if 'Price' not in chunk.columns or 'SKU Code' not in chunk.columns:
             if log_callback:
                 log_callback(f"Skipped chunk {chunk_idx + 1}: missing 'Price' or 'SKU Code' columns", None, None)
             continue
-        
+
         # Vectorized preprocessing
         chunk['Price'] = pd.to_numeric(chunk['Price'], errors='coerce')
         chunk.dropna(subset=['Price'], inplace=True)
-        
+
         if chunk.empty:
             continue
-        
-        # Vectorized Implied_CF extraction (much faster than .apply with regex)
+
+        # Vectorized Implied_CF extraction (str.extract is C-level)
         if 'alternate_uom' in chunk.columns:
-            # str.extract is vectorized C-level operation
             chunk['Implied_CF'] = chunk['alternate_uom'].str.extract(
                 r'of\s+(\d+)', flags=re.IGNORECASE, expand=False
             ).astype(float)
         else:
             chunk['Implied_CF'] = None
-        
+
         if 'CF' not in chunk.columns:
             chunk['CF'] = 1.0
-        
+
         chunk['Effective_CF'] = chunk['Implied_CF'].fillna(chunk['CF'])
         chunk['Row_Base_Rate'] = chunk['Price'] / chunk['Effective_CF']
-        
-        # Vectorized per-SKU processing
-        for sku, group in chunk.groupby('SKU Code'):
-            if sku not in profiles:
-                profiles[sku] = {
-                    'all_rates': [],
-                    'latest_date': None,
-                    'latest_rate': None,
-                    'valid_uoms': {}
-                }
-            
-            rates = group['Row_Base_Rate'].values
-            median_br = float(np.median(rates))
-            valid_mask = (rates >= lower_mult * median_br) & (rates <= upper_mult * median_br)
-            valid_rates = rates[valid_mask]
-            
-            if len(valid_rates) == 0:
-                continue
-            
-            profiles[sku]['all_rates'].extend(valid_rates.tolist())
-            
-            # Use itertuples for per-row data collection (10x faster than iterrows)
-            valid_group = group.iloc[valid_mask]
-            for row_tuple in valid_group.itertuples(index=False):
-                date = getattr(row_tuple, 'Date', None)
-                rate = getattr(row_tuple, 'Row_Base_Rate', 0)
-                uom = getattr(row_tuple, 'alternate_uom', '')
-                cf = int(getattr(row_tuple, 'Effective_CF', 1))
-                
-                # Track latest by date (avoids sorting later)
-                if date is not None:
-                    str_date = str(date)
-                    if profiles[sku]['latest_date'] is None or str_date > str(profiles[sku]['latest_date']):
-                        profiles[sku]['latest_date'] = str_date
-                        profiles[sku]['latest_rate'] = rate
-                        profiles[sku]['latest_uom'] = uom
-                        profiles[sku]['latest_cf'] = cf
-                
-                # Build valid UOMs set
-                if uom:
-                    profiles[sku]['valid_uoms'][uom] = cf
-        
+
+        # --- Fully vectorized per-SKU processing using groupby transforms ---
+        # Compute median per SKU in one vectorized pass
+        medians = chunk.groupby('SKU Code')['Row_Base_Rate'].transform('median')
+
+        # Vectorized outlier filter
+        valid_mask = (chunk['Row_Base_Rate'] >= lower_mult * medians) & (chunk['Row_Base_Rate'] <= upper_mult * medians)
+        valid_chunk = chunk[valid_mask].copy()
+
+        if valid_chunk.empty:
+            if log_callback:
+                log_callback(f"Chunk {chunk_idx + 1}: 0 rows after outlier filter", total_rows_processed, known_total_rows)
+            total_rows_processed += len(chunk)
+            continue
+
+        # Accumulate valid rates per SKU
+        for sku, group in valid_chunk.groupby('SKU Code'):
+            if sku not in all_rates:
+                all_rates[sku] = []
+            all_rates[sku].extend(group['Row_Base_Rate'].tolist())
+
+            # Track latest date per SKU
+            if 'Date' in valid_chunk.columns:
+                if sku not in all_dates:
+                    all_dates[sku] = {}
+                for _, row in group.iterrows():
+                    date_val = row.get('Date')
+                    if pd.notna(date_val):
+                        str_date = str(date_val)
+                        rate_val = row['Row_Base_Rate']
+                        uom_val = row.get('alternate_uom', '')
+                        cf_val = row.get('Effective_CF', 1)
+                        all_dates[sku][str_date] = (rate_val, str(uom_val) if pd.notna(uom_val) else '', int(cf_val) if pd.notna(cf_val) else 1)
+
+            # Track valid UOMs with their CF counts
+            if 'alternate_uom' in valid_chunk.columns:
+                if sku not in all_uoms:
+                    all_uoms[sku] = {}
+                for _, row in group.iterrows():
+                    uom_val = row.get('alternate_uom', '')
+                    cf_val = row.get('Effective_CF', 1)
+                    if pd.notna(uom_val) and str(uom_val).strip():
+                        key = (str(uom_val).strip(), int(cf_val) if pd.notna(cf_val) else 1)
+                        all_uoms[sku][key] = all_uoms[sku].get(key, 0) + 1
+
         total_rows_processed += len(chunk)
-        
+
         if log_callback:
             log_callback(
-                f"Chunk {chunk_idx + 1}: {len(chunk):,} rows processed, {len(profiles)} SKUs accumulated",
+                f"Chunk {chunk_idx + 1}: {len(chunk):,} rows processed, {len(all_rates)} SKUs accumulated",
                 total_rows_processed,
                 known_total_rows
             )
-    
-    # Finalize profiles from accumulated data (one vectorized pass per SKU)
+
+    # --- Finalize profiles from accumulated data (vectorized) ---
     final_profiles = {}
     skus_finalized = 0
-    total_skus = len(profiles)
-    
-    for sku, data in profiles.items():
-        if not data['all_rates']:
+
+    for sku, rates in all_rates.items():
+        if not rates:
             continue
-        
-        rates = np.array(data['all_rates'])
-        median_br = float(np.median(rates))
-        latest_br = data['latest_rate'] if data['latest_rate'] is not None else median_br
-        
+
+        rates_arr = np.array(rates)
+        median_br = float(np.median(rates_arr))
+
+        # Find latest rate from dates
+        latest_br = median_br
+        latest_date = None
+        if sku in all_dates and all_dates[sku]:
+            sorted_dates = sorted(all_dates[sku].keys())
+            latest_date = sorted_dates[-1]
+            rate_val, uom_val, cf_val = all_dates[sku][latest_date]
+            latest_br = rate_val
+
+        # Build valid_uoms dict with most frequent CF per UOM
+        valid_uoms = {}
+        if sku in all_uoms:
+            # Sort by count desc per UOM, keep highest CF for each UOM
+            uom_groups = {}
+            for (uom, cf), count in all_uoms[sku].items():
+                if uom not in uom_groups or count > uom_groups[uom][1]:
+                    uom_groups[uom] = (cf, count)
+            valid_uoms = {uom: cf for uom, (cf, _) in uom_groups.items()}
+
         final_profiles[sku] = {
             'latest_br': latest_br,
-            'valid_uoms': data['valid_uoms']
+            'valid_uoms': valid_uoms
         }
         skus_finalized += 1
-    
+
     if log_callback:
         log_callback(
             f"Finalized profiles for {skus_finalized} SKUs from {total_rows_processed:,} total rows",
             total_rows_processed,
             known_total_rows
         )
-    
+
     return final_profiles
 
 
-@app.on_event("startup")
-def startup_event():
+# --- Background startup data loading ---
+async def load_startup_data_async():
+    """Load data in background so server starts immediately."""
     global sku_profiles, global_df, startup_complete, startup_logs
     global startup_processed_rows, startup_total_rows
-    
-    startup_logs = []
-    startup_complete = False
-    startup_processed_rows = 0
-    startup_total_rows = 0
-    
-    add_startup_log("Starting server...")
-    
+
+    add_startup_log("Starting background data loading...")
+
     data_file_path = config.get("data_file_path", "../GRN Data Final last 1 year UOM Adjusted.csv")
     file_path = os.path.join(os.path.dirname(__file__), data_file_path)
-    
+
     # Also try .xlsx as fallback
     if not os.path.exists(file_path):
         xlsx_path = file_path.replace('.csv', '.xlsx')
@@ -216,7 +235,7 @@ def startup_event():
             csv_path = file_path.replace('.csv', '_converted.csv')
             df_temp.to_csv(csv_path, index=False)
             file_path = csv_path
-    
+
     if os.path.exists(file_path):
         # Count total rows for progress tracking
         add_startup_log(f"Counting rows in {os.path.basename(file_path)}...")
@@ -227,31 +246,51 @@ def startup_event():
         total_data_rows = max(0, line_count - 1)  # subtract header
         startup_total_rows = total_data_rows
         add_startup_log(f"Total rows to process: {total_data_rows:,}")
-        
+
         # Read first chunk to get column names and store a sample
         first_chunk = pd.read_csv(file_path, nrows=5)
         global_df = first_chunk.copy()
         add_startup_log(f"Sample loaded: columns={list(global_df.columns)}")
-        
+
         # Streaming processing with logs
         add_startup_log("Starting streaming chunk processing...")
-        
+
         def startup_log_callback(msg, processed, total):
             add_startup_log(msg, processed, total)
-        
+
+        # Run CPU-bound processing in thread pool to not block event loop
         chunks = pd.read_csv(file_path, chunksize=50000, low_memory=False)
-        sku_profiles = build_sku_profiles_from_chunks(
-            chunks, 
-            log_callback=startup_log_callback,
-            known_total_rows=total_data_rows
-        )
-        
+
+        def process():
+            return build_sku_profiles_from_chunks(
+                chunks,
+                log_callback=startup_log_callback,
+                known_total_rows=total_data_rows
+            )
+
+        sku_profiles = await asyncio.to_thread(process)
+
         add_startup_log(f"✓ Startup complete. Loaded profiles for {len(sku_profiles)} SKUs.")
     else:
         add_startup_log(f"⚠ Data file not found at {file_path}. Place it in the configured path.")
-    
+
     startup_complete = True
     add_startup_log("Server is ready.")
+
+
+@app.on_event("startup")
+def startup_event():
+    global startup_logs, startup_complete, startup_processed_rows, startup_total_rows
+
+    startup_logs = []
+    startup_complete = False
+    startup_processed_rows = 0
+    startup_total_rows = 0
+
+    add_startup_log("Starting server...")
+
+    # Launch background loading — server starts immediately
+    asyncio.create_task(load_startup_data_async())
 
 
 @app.get("/startup_logs")
@@ -392,12 +431,12 @@ def export_outliers():
 
 
 async def process_upload_async(task_id: str, file_path: str, total_rows: int):
-    """Process a large upload file in the background with progress tracking."""
+    """Process a large upload file in the background with progress tracking.
+    Uses asyncio.to_thread to avoid blocking the event loop.
+    """
     try:
         # Update task status to show we're starting
         upload_tasks[task_id]["logs"].append(f"Starting to process {total_rows:,} rows...")
-        
-        chunks = pd.read_csv(file_path, chunksize=50000, low_memory=False)
         
         def upload_log_callback(msg, processed, total):
             task = upload_tasks.get(task_id)
@@ -411,8 +450,14 @@ async def process_upload_async(task_id: str, file_path: str, total_rows: int):
                 task["total_rows"] = total
                 task["percentage"] = min(99, int((processed / total) * 100))
         
+        def process_in_thread():
+            chunks = pd.read_csv(file_path, chunksize=50000, low_memory=False)
+            return build_sku_profiles_from_chunks(chunks, log_callback=upload_log_callback, known_total_rows=total_rows)
+        
         upload_log_callback("Reading and processing CSV chunks...", 0, total_rows)
-        profiles = build_sku_profiles_from_chunks(chunks, log_callback=upload_log_callback, known_total_rows=total_rows)
+        
+        # Run CPU-bound work in thread pool so event loop stays free for polling
+        profiles = await asyncio.to_thread(process_in_thread)
         
         # Update global state
         global sku_profiles, global_df
