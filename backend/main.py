@@ -6,6 +6,9 @@ import json
 import io
 import os
 import asyncio
+import uuid
+import tempfile
+import time
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -36,37 +39,71 @@ global_df = None
 # In-memory task status store for async uploads
 upload_tasks = {}
 
+# Startup logs — accumulated during boot, exposed via API
+startup_logs = []
+startup_complete = False
+startup_total_rows = 0
+startup_processed_rows = 0
+
+
 class PredictRequest(BaseModel):
     sku_code: str
     input_price: float
 
-def build_sku_profiles_from_chunks(chunks):
+
+def add_startup_log(message, processed=None, total=None):
+    """Append a log entry with timestamp for startup."""
+    global startup_logs, startup_processed_rows, startup_total_rows
+    ts = time.strftime("%H:%M:%S")
+    entry = f"[{ts}] {message}"
+    startup_logs.append(entry)
+    # Keep last 200 logs to avoid unbounded memory
+    if len(startup_logs) > 200:
+        startup_logs = startup_logs[-200:]
+    if processed is not None:
+        startup_processed_rows = processed
+    if total is not None:
+        startup_total_rows = total
+
+
+def build_sku_profiles_from_chunks(chunks, log_callback=None, known_total_rows=None):
     """
-    Process CSV in streaming chunks and build SKU profiles incrementally.
-    Never holds the full DataFrame in memory — only the profiles dict grows.
+    Process CSV in streaming chunks and build SKU profiles using vectorized operations.
+    Uses itertuples instead of iterrows for ~10x faster per-row access.
+    Tracks latest date during iteration instead of sorting at the end.
     """
     profiles = {}
     lower_mult = config.get("historical_data", {}).get("median_br_lower_multiplier", 0.2)
     upper_mult = config.get("historical_data", {}).get("median_br_upper_multiplier", 5.0)
+    total_rows_processed = 0
+    total_chunks = 0
 
     for chunk_idx, chunk in enumerate(chunks):
-        # Rename columns
+        total_chunks = chunk_idx + 1
+        
+        # Rename columns for consistency
         rename_map = {"PO Purchase Rate": "Price", "invoice_date": "Date"}
         chunk.rename(columns=rename_map, inplace=True)
         
         # Ensure required columns exist
         if 'Price' not in chunk.columns or 'SKU Code' not in chunk.columns:
+            if log_callback:
+                log_callback(f"Skipped chunk {chunk_idx + 1}: missing 'Price' or 'SKU Code' columns", None, None)
             continue
         
+        # Vectorized preprocessing
         chunk['Price'] = pd.to_numeric(chunk['Price'], errors='coerce')
         chunk.dropna(subset=['Price'], inplace=True)
         
-        def get_implied_cf(text):
-            match = re.search(r'of\s+(\d+)', str(text), re.IGNORECASE)
-            return int(match.group(1)) if match else None
+        if chunk.empty:
+            continue
         
+        # Vectorized Implied_CF extraction (much faster than .apply with regex)
         if 'alternate_uom' in chunk.columns:
-            chunk['Implied_CF'] = chunk['alternate_uom'].apply(get_implied_cf)
+            # str.extract is vectorized C-level operation
+            chunk['Implied_CF'] = chunk['alternate_uom'].str.extract(
+                r'of\s+(\d+)', flags=re.IGNORECASE, expand=False
+            ).astype(float)
         else:
             chunk['Implied_CF'] = None
         
@@ -76,56 +113,97 @@ def build_sku_profiles_from_chunks(chunks):
         chunk['Effective_CF'] = chunk['Implied_CF'].fillna(chunk['CF'])
         chunk['Row_Base_Rate'] = chunk['Price'] / chunk['Effective_CF']
         
-        # Group by SKU within this chunk
+        # Vectorized per-SKU processing
         for sku, group in chunk.groupby('SKU Code'):
             if sku not in profiles:
-                # Initialize with first occurrence
-                profiles[sku] = {'all_rates': [], 'date_rate_map': [], 'valid_uoms': {}}
+                profiles[sku] = {
+                    'all_rates': [],
+                    'latest_date': None,
+                    'latest_rate': None,
+                    'valid_uoms': {}
+                }
             
-            median_br = group['Row_Base_Rate'].median()
-            valid_mask = (group['Row_Base_Rate'] >= lower_mult * median_br) & (group['Row_Base_Rate'] <= upper_mult * median_br)
-            clean_group = group[valid_mask]
+            rates = group['Row_Base_Rate'].values
+            median_br = float(np.median(rates))
+            valid_mask = (rates >= lower_mult * median_br) & (rates <= upper_mult * median_br)
+            valid_rates = rates[valid_mask]
             
-            if clean_group.empty:
+            if len(valid_rates) == 0:
                 continue
             
-            # Collect valid rates for this SKU
-            for _, row in clean_group.iterrows():
-                rate = row['Row_Base_Rate']
-                uom = row.get('alternate_uom', '')
-                cf = int(row['Effective_CF'])
-                date = row.get('Date', None)
-                profiles[sku]['all_rates'].append(rate)
-                profiles[sku]['date_rate_map'].append((date, rate, uom, cf))
+            profiles[sku]['all_rates'].extend(valid_rates.tolist())
+            
+            # Use itertuples for per-row data collection (10x faster than iterrows)
+            valid_group = group.iloc[valid_mask]
+            for row_tuple in valid_group.itertuples(index=False):
+                date = getattr(row_tuple, 'Date', None)
+                rate = getattr(row_tuple, 'Row_Base_Rate', 0)
+                uom = getattr(row_tuple, 'alternate_uom', '')
+                cf = int(getattr(row_tuple, 'Effective_CF', 1))
+                
+                # Track latest by date (avoids sorting later)
+                if date is not None:
+                    str_date = str(date)
+                    if profiles[sku]['latest_date'] is None or str_date > str(profiles[sku]['latest_date']):
+                        profiles[sku]['latest_date'] = str_date
+                        profiles[sku]['latest_rate'] = rate
+                        profiles[sku]['latest_uom'] = uom
+                        profiles[sku]['latest_cf'] = cf
+                
+                # Build valid UOMs set
+                if uom:
+                    profiles[sku]['valid_uoms'][uom] = cf
+        
+        total_rows_processed += len(chunk)
+        
+        if log_callback:
+            log_callback(
+                f"Chunk {chunk_idx + 1}: {len(chunk):,} rows processed, {len(profiles)} SKUs accumulated",
+                total_rows_processed,
+                known_total_rows
+            )
     
-    # Finalize profiles from accumulated data
+    # Finalize profiles from accumulated data (one vectorized pass per SKU)
     final_profiles = {}
+    skus_finalized = 0
+    total_skus = len(profiles)
+    
     for sku, data in profiles.items():
         if not data['all_rates']:
             continue
         
         rates = np.array(data['all_rates'])
         median_br = float(np.median(rates))
+        latest_br = data['latest_rate'] if data['latest_rate'] is not None else median_br
         
-        # Sort by date to find latest
-        sorted_by_date = sorted(data['date_rate_map'], key=lambda x: str(x[0]) if x[0] else '')
-        latest_br = sorted_by_date[-1][1] if sorted_by_date else median_br
-        
-        # Build valid_uoms
-        uom_cf_pairs = set()
-        for _, rate, uom, cf in sorted_by_date:
-            if uom:
-                uom_cf_pairs.add((uom, cf))
-        
-        valid_uoms = {pair[0]: pair[1] for pair in uom_cf_pairs}
-        final_profiles[sku] = {'latest_br': latest_br, 'valid_uoms': valid_uoms}
+        final_profiles[sku] = {
+            'latest_br': latest_br,
+            'valid_uoms': data['valid_uoms']
+        }
+        skus_finalized += 1
+    
+    if log_callback:
+        log_callback(
+            f"Finalized profiles for {skus_finalized} SKUs from {total_rows_processed:,} total rows",
+            total_rows_processed,
+            known_total_rows
+        )
     
     return final_profiles
 
 
 @app.on_event("startup")
 def startup_event():
-    global sku_profiles, global_df
+    global sku_profiles, global_df, startup_complete, startup_logs
+    global startup_processed_rows, startup_total_rows
+    
+    startup_logs = []
+    startup_complete = False
+    startup_processed_rows = 0
+    startup_total_rows = 0
+    
+    add_startup_log("Starting server...")
+    
     data_file_path = config.get("data_file_path", "../GRN Data Final last 1 year UOM Adjusted.csv")
     file_path = os.path.join(os.path.dirname(__file__), data_file_path)
     
@@ -133,24 +211,58 @@ def startup_event():
     if not os.path.exists(file_path):
         xlsx_path = file_path.replace('.csv', '.xlsx')
         if os.path.exists(xlsx_path):
-            # Convert .xlsx to CSV first, then stream
-            print(f"Converting XLSX to CSV for streaming: {xlsx_path}")
+            add_startup_log(f"Converting XLSX to CSV: {xlsx_path}")
             df_temp = pd.read_excel(xlsx_path)
             csv_path = file_path.replace('.csv', '_converted.csv')
             df_temp.to_csv(csv_path, index=False)
             file_path = csv_path
     
     if os.path.exists(file_path):
-        # Read first chunk to get column names and store a sample for template
+        # Count total rows for progress tracking
+        add_startup_log(f"Counting rows in {os.path.basename(file_path)}...")
+        line_count = 0
+        with open(file_path, 'r') as f:
+            for _ in f:
+                line_count += 1
+        total_data_rows = max(0, line_count - 1)  # subtract header
+        startup_total_rows = total_data_rows
+        add_startup_log(f"Total rows to process: {total_data_rows:,}")
+        
+        # Read first chunk to get column names and store a sample
         first_chunk = pd.read_csv(file_path, nrows=5)
         global_df = first_chunk.copy()
+        add_startup_log(f"Sample loaded: columns={list(global_df.columns)}")
         
-        # Stream the full file in chunks
+        # Streaming processing with logs
+        add_startup_log("Starting streaming chunk processing...")
+        
+        def startup_log_callback(msg, processed, total):
+            add_startup_log(msg, processed, total)
+        
         chunks = pd.read_csv(file_path, chunksize=50000, low_memory=False)
-        sku_profiles = build_sku_profiles_from_chunks(chunks)
-        print(f"Loaded profiles for {len(sku_profiles)} SKUs (streaming mode).")
+        sku_profiles = build_sku_profiles_from_chunks(
+            chunks, 
+            log_callback=startup_log_callback,
+            known_total_rows=total_data_rows
+        )
+        
+        add_startup_log(f"✓ Startup complete. Loaded profiles for {len(sku_profiles)} SKUs.")
     else:
-        print(f"Data file not found at {file_path}. Please place it in the configured path.")
+        add_startup_log(f"⚠ Data file not found at {file_path}. Place it in the configured path.")
+    
+    startup_complete = True
+    add_startup_log("Server is ready.")
+
+
+@app.get("/startup_logs")
+def get_startup_logs():
+    """Return startup logs + status. Frontend polls this on mount."""
+    return {
+        "complete": startup_complete,
+        "logs": startup_logs,
+        "total_rows": startup_total_rows,
+        "processed_rows": startup_processed_rows
+    }
 
 
 @app.post("/predict_uom")
@@ -279,14 +391,32 @@ def export_outliers():
     )
 
 
-async def process_upload_async(task_id: str, file_path: str):
-    """Process a large upload file in the background."""
+async def process_upload_async(task_id: str, file_path: str, total_rows: int):
+    """Process a large upload file in the background with progress tracking."""
     try:
+        # Update task status to show we're starting
+        upload_tasks[task_id]["logs"].append(f"Starting to process {total_rows:,} rows...")
+        
         chunks = pd.read_csv(file_path, chunksize=50000, low_memory=False)
-        profiles = build_sku_profiles_from_chunks(chunks)
+        
+        def upload_log_callback(msg, processed, total):
+            task = upload_tasks.get(task_id)
+            if task is None:
+                return
+            task["logs"].append(msg)
+            if len(task["logs"]) > 100:
+                task["logs"] = task["logs"][-100:]
+            task["processed_rows"] = processed
+            if total:
+                task["total_rows"] = total
+                task["percentage"] = min(99, int((processed / total) * 100))
+        
+        upload_log_callback("Reading and processing CSV chunks...", 0, total_rows)
+        profiles = build_sku_profiles_from_chunks(chunks, log_callback=upload_log_callback, known_total_rows=total_rows)
         
         # Update global state
         global sku_profiles, global_df
+        upload_log_callback(f"Updating system with {len(profiles)} SKU profiles...", total_rows, total_rows)
         sku_profiles = profiles
         
         # Read first chunk as sample for global_df
@@ -299,15 +429,20 @@ async def process_upload_async(task_id: str, file_path: str):
         except:
             pass
         
-        upload_tasks[task_id] = {
+        upload_tasks[task_id].update({
             "status": "success",
-            "message": f"Successfully loaded {len(sku_profiles)} SKUs from uploaded file."
-        }
+            "percentage": 100,
+            "processed_rows": total_rows,
+            "message": f"Successfully loaded {len(sku_profiles):,} SKUs from {total_rows:,} rows.",
+            "logs": upload_tasks[task_id]["logs"] + [f"✓ Complete! {len(sku_profiles):,} SKUs loaded."]
+        })
     except Exception as e:
-        upload_tasks[task_id] = {
+        upload_tasks[task_id].update({
             "status": "error",
-            "message": f"Failed to process file: {str(e)}"
-        }
+            "percentage": 0,
+            "message": f"Failed to process file: {str(e)}",
+            "logs": upload_tasks[task_id].get("logs", []) + [f"✗ Error: {str(e)}"]
+        })
 
 
 @app.post("/upload_data")
@@ -327,43 +462,33 @@ async def upload_data(file: UploadFile = File(...)):
         if row_count <= 0:
             return {"status": "error", "message": "File appears to be empty or has no data rows."}
         
-        # For files <= 100K rows, process inline
-        if row_count <= 100000:
-            csv_buffer = io.BytesIO(contents)
-            chunks = pd.read_csv(csv_buffer, chunksize=50000, low_memory=False)
-            sku_profiles = build_sku_profiles_from_chunks(chunks)
-            
-            # Load sample for global_df from original bytes (buffer may be consumed)
-            global_df = pd.read_csv(io.BytesIO(contents), nrows=5)
-            
-            return {
-                "status": "success",
-                "message": f"Successfully loaded {len(sku_profiles)} SKUs from {row_count:,} rows."
-            }
-        else:
-            # For large files (> 100K rows), use async processing
-            import uuid
-            import tempfile
-            
-            task_id = str(uuid.uuid4())
-            
-            # Save to temp file
-            temp_dir = tempfile.gettempdir()
-            temp_path = os.path.join(temp_dir, f"grn_upload_{task_id}.csv")
-            with open(temp_path, 'wb') as f:
-                f.write(contents)
-            
-            # Initialize task status
-            upload_tasks[task_id] = {"status": "processing", "message": f"Processing {row_count:,} rows in the background..."}
-            
-            # Launch background processing
-            asyncio.create_task(process_upload_async(task_id, temp_path))
-            
-            return {
-                "status": "accepted",
-                "task_id": task_id,
-                "message": f"File with {row_count:,} rows is being processed in the background."
-            }
+        # Generate task ID
+        task_id = str(uuid.uuid4())
+        
+        # Save to temp file
+        temp_dir = tempfile.gettempdir()
+        temp_path = os.path.join(temp_dir, f"grn_upload_{task_id}.csv")
+        with open(temp_path, 'wb') as f:
+            f.write(contents)
+        
+        # Initialize task status with progress tracking
+        upload_tasks[task_id] = {
+            "status": "processing",
+            "percentage": 0,
+            "processed_rows": 0,
+            "total_rows": row_count,
+            "message": f"Queued {row_count:,} rows for processing...",
+            "logs": [f"File received: {file.filename} ({row_count:,} rows)", "Queued for background processing..."]
+        }
+        
+        # Launch background processing (always async for consistency)
+        asyncio.create_task(process_upload_async(task_id, temp_path, row_count))
+        
+        return {
+            "status": "accepted",
+            "task_id": task_id,
+            "message": f"File with {row_count:,} rows is being processed in the background."
+        }
             
     except Exception as e:
         return {"status": "error", "message": f"Failed to process file: {str(e)}"}
@@ -371,7 +496,16 @@ async def upload_data(file: UploadFile = File(...)):
 
 @app.get("/upload_status/{task_id}")
 def upload_status(task_id: str):
-    """Poll this endpoint to check the status of an async upload."""
+    """Poll this endpoint to check the status of an async upload.
+    
+    Returns:
+        status: "processing" | "success" | "error"
+        percentage: int (0-100)
+        processed_rows: int
+        total_rows: int
+        logs: list[str]
+        message: str
+    """
     task = upload_tasks.get(task_id)
     if not task:
         return {"status": "error", "message": "Task ID not found."}

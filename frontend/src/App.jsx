@@ -1,10 +1,195 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
-import { AlertTriangle, CheckCircle2, Download, Upload, FileDown, FileUp } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Download, Upload, FileDown, FileUp, Terminal } from 'lucide-react';
 import clsx from 'clsx';
 
 const API_URL = import.meta.env.VITE_API_URL || 'https://uom-issues.onrender.com';
 const MAX_FILE_SIZE_MB = 50;
+
+function StartupOverlay({ show }) {
+  const [logs, setLogs] = useState([]);
+  const [complete, setComplete] = useState(false);
+  const logEndRef = useRef(null);
+
+  useEffect(() => {
+    if (!show) return;
+
+    const poll = async () => {
+      try {
+        const res = await axios.get(`${API_URL}/startup_logs`);
+        setLogs(res.data.logs || []);
+        setComplete(res.data.complete);
+        return res.data.complete;
+      } catch {
+        return false;
+      }
+    };
+
+    // Initial fetch
+    poll();
+
+    const interval = setInterval(async () => {
+      const done = await poll();
+      if (done) {
+        clearInterval(interval);
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [show]);
+
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [logs]);
+
+  if (!show || complete) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 bg-gray-900 bg-opacity-95 flex items-center justify-center p-4">
+      <div className="max-w-2xl w-full">
+        <div className="flex items-center space-x-3 mb-4">
+          <div className="w-5 h-5 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin"></div>
+          <h2 className="text-lg font-semibold text-white">Loading Data...</h2>
+        </div>
+        <div className="bg-gray-950 rounded-xl border border-gray-700 overflow-hidden shadow-2xl">
+          <div className="flex items-center space-x-2 px-4 py-2 bg-gray-800 border-b border-gray-700">
+            <Terminal className="w-4 h-4 text-gray-400" />
+            <span className="text-xs text-gray-400 font-mono">startup.log</span>
+          </div>
+          <div className="p-4 max-h-96 overflow-y-auto font-mono text-sm space-y-1">
+            {logs.length === 0 ? (
+              <div className="text-gray-500 italic">Connecting to server...</div>
+            ) : (
+              logs.map((log, i) => (
+                <div
+                  key={i}
+                  className={clsx(
+                    "opacity-90 leading-relaxed",
+                    log.includes("✓") ? "text-green-400" :
+                    log.includes("⚠") ? "text-yellow-400" :
+                    log.includes("✗") ? "text-red-400" :
+                    "text-gray-300"
+                  )}
+                >
+                  <span className="text-gray-500 mr-2">$</span>
+                  {log}
+                </div>
+              ))
+            )}
+            <div ref={logEndRef} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function UploadProgress({ progress, onDismiss }) {
+  const logEndRef = useRef(null);
+
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [progress?.logs]);
+
+  if (!progress) return null;
+
+  const isFinished = progress.status === 'success' || progress.status === 'error';
+
+  return (
+    <div className="mt-3 bg-white rounded-lg border border-gray-200 overflow-hidden shadow-sm">
+      {/* Terminal header */}
+      <div className="flex items-center justify-between px-3 py-2 bg-gray-800 border-b border-gray-700">
+        <div className="flex items-center space-x-2">
+          <Terminal className="w-3.5 h-3.5 text-gray-400" />
+          <span className="text-xs text-gray-400 font-mono">upload-process.log</span>
+        </div>
+        {isFinished && (
+          <button
+            onClick={onDismiss}
+            className="text-xs text-gray-400 hover:text-white transition-colors"
+          >
+            ✕
+          </button>
+        )}
+      </div>
+
+      <div className="p-4 space-y-3">
+        {/* Progress bar */}
+        <div>
+          <div className="flex justify-between text-sm text-gray-600 mb-1.5">
+            <span className="font-medium">
+              {progress.status === 'success' ? 'Processing complete' :
+               progress.status === 'error' ? 'Processing failed' :
+               'Processing file...'}
+            </span>
+            <span className={clsx(
+              "font-semibold",
+              progress.status === 'success' ? "text-green-600" :
+              progress.status === 'error' ? "text-red-600" :
+              "text-indigo-600"
+            )}>
+              {progress.percentage}%
+            </span>
+          </div>
+          <div className="w-full bg-gray-200 rounded-full h-3 overflow-hidden">
+            <div
+              className={clsx(
+                "h-3 rounded-full transition-all duration-500 ease-out",
+                progress.status === 'success' ? "bg-green-500" :
+                progress.status === 'error' ? "bg-red-500" :
+                "bg-gradient-to-r from-indigo-500 to-indigo-700"
+              )}
+              style={{ width: `${progress.percentage}%` }}
+            />
+          </div>
+          <div className="flex justify-between mt-1">
+            <span className="text-xs text-gray-400">
+              {(progress.processed_rows || 0).toLocaleString()} / {(progress.total_rows || 0).toLocaleString()} rows
+            </span>
+            {progress.percentage > 0 && progress.percentage < 100 && (
+              <span className="text-xs text-gray-400">
+                ~{Math.max(1, Math.round(((progress.total_rows || 1) - (progress.processed_rows || 0)) / Math.max(1, (progress.processed_rows || 0)) * 2))}s remaining
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Log viewer */}
+        {progress.logs && progress.logs.length > 0 && (
+          <div className="max-h-40 overflow-y-auto bg-gray-900 text-green-400 rounded-lg p-3 text-xs font-mono space-y-1">
+            {progress.logs.map((log, i) => (
+              <div
+                key={i}
+                className={clsx(
+                  "opacity-90 leading-relaxed",
+                  log.includes("✓") ? "text-green-400" :
+                  log.includes("✗") ? "text-red-400" :
+                  log.includes("⚠") ? "text-yellow-400" :
+                  "text-gray-300"
+                )}
+              >
+                <span className="text-gray-600 mr-1.5">{'>'}</span>
+                {log}
+              </div>
+            ))}
+            <div ref={logEndRef} />
+          </div>
+        )}
+
+        {/* Status message */}
+        {progress.message && isFinished && (
+          <div className={clsx(
+            "text-sm font-medium p-2 rounded",
+            progress.status === 'success' ? "text-green-700 bg-green-50" :
+            "text-red-700 bg-red-50"
+          )}>
+            {progress.message}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function App() {
   const [skuCode, setSkuCode] = useState('');
@@ -21,8 +206,27 @@ function App() {
   const [selectedFile, setSelectedFile] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState({ type: '', text: '' });
+  const [uploadProgress, setUploadProgress] = useState(null);
+  const [showStartupOverlay, setShowStartupOverlay] = useState(false);
 
   const debounceTimeout = useRef(null);
+  const pollTimeout = useRef(null);
+
+  // Check server status on mount
+  useEffect(() => {
+    const checkServer = async () => {
+      try {
+        const res = await axios.get(`${API_URL}/startup_logs`);
+        if (!res.data.complete) {
+          setShowStartupOverlay(true);
+        }
+      } catch {
+        // Server might be starting up, show overlay
+        setShowStartupOverlay(true);
+      }
+    };
+    checkServer();
+  }, []);
 
   const handleFileChange = (e) => {
     if (e.target.files && e.target.files[0]) {
@@ -43,10 +247,41 @@ function App() {
     }
   };
 
+  const pollUploadStatus = useCallback((taskId) => {
+    const poll = async () => {
+      try {
+        const response = await axios.get(`${API_URL}/upload_status/${taskId}`);
+        const data = response.data;
+
+        // Update progress state
+        setUploadProgress(data);
+
+        if (data.status === 'success' || data.status === 'error') {
+          setUploadMsg({
+            type: data.status === 'success' ? 'success' : 'error',
+            text: data.message
+          });
+          setIsUploading(false);
+          return;
+        }
+
+        // Continue polling every 2 seconds
+        pollTimeout.current = setTimeout(poll, 2000);
+      } catch (error) {
+        console.error("Error polling upload status:", error);
+        setUploadMsg({ type: 'error', text: 'Failed to check upload progress. The server may still be processing your file.' });
+        setIsUploading(false);
+      }
+    };
+
+    poll();
+  }, []);
+
   const handleUpload = async () => {
     if (!selectedFile) return;
     setIsUploading(true);
     setUploadMsg({ type: '', text: '' });
+    setUploadProgress(null);
     
     const formData = new FormData();
     formData.append('file', selectedFile);
@@ -60,51 +295,20 @@ function App() {
       
       if (response.data.status === 'success') {
         setUploadMsg({ type: 'success', text: response.data.message });
+        setIsUploading(false);
       } else if (response.data.status === 'accepted') {
         // Async upload - start polling
         setUploadMsg({ type: 'info', text: response.data.message });
         pollUploadStatus(response.data.task_id);
       } else {
         setUploadMsg({ type: 'error', text: response.data.message });
+        setIsUploading(false);
       }
     } catch (error) {
       console.error("Error uploading file:", error);
       setUploadMsg({ type: 'error', text: "Failed to upload file. Ensure backend is running." });
-    } finally {
       setIsUploading(false);
     }
-  };
-
-  const pollUploadStatus = async (taskId) => {
-    const maxAttempts = 60; // 5 minutes max (5s interval)
-    let attempts = 0;
-
-    const poll = async () => {
-      try {
-        const response = await axios.get(`${API_URL}/upload_status/${taskId}`);
-        const data = response.data;
-
-        if (data.status === 'success') {
-          setUploadMsg({ type: 'success', text: data.message });
-          return;
-        } else if (data.status === 'error') {
-          setUploadMsg({ type: 'error', text: data.message });
-          return;
-        } else if (data.status === 'processing') {
-          if (attempts < maxAttempts) {
-            attempts++;
-            setTimeout(poll, 5000); // Poll every 5 seconds
-          } else {
-            setUploadMsg({ type: 'error', text: 'Upload processing timed out after 5 minutes. Please try again with a smaller file.' });
-          }
-        }
-      } catch (error) {
-        console.error("Error polling upload status:", error);
-        setUploadMsg({ type: 'error', text: 'Failed to check upload progress. The server may still be processing your file.' });
-      }
-    };
-
-    poll();
   };
 
   const handleDownloadTemplate = async () => {
@@ -199,8 +403,15 @@ function App() {
     return () => clearTimeout(debounceTimeout.current);
   }, [skuCode, inputPrice]);
 
+  const handleDismissProgress = () => {
+    setUploadProgress(null);
+  };
+
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
+      {/* Startup loading overlay */}
+      <StartupOverlay show={showStartupOverlay} />
+
       <div className="max-w-xl w-full bg-white rounded-xl shadow-lg overflow-hidden border border-gray-100">
         
         {/* Header */}
@@ -263,7 +474,12 @@ function App() {
               </button>
             </div>
           </div>
-          {uploadMsg.text && (
+          
+          {/* Upload progress bar + logs */}
+          <UploadProgress progress={uploadProgress} onDismiss={handleDismissProgress} />
+
+          {/* Status message for non-progress messages */}
+          {uploadMsg.text && !uploadProgress && (
             <div className={clsx(
               "mt-3 p-3 rounded-lg text-sm font-medium animate-in fade-in flex items-center",
               uploadMsg.type === 'success' ? "bg-green-50 text-green-700 border border-green-200" : 
