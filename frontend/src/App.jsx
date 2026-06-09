@@ -6,11 +6,12 @@ import clsx from 'clsx';
 const API_URL = import.meta.env.VITE_API_URL || 'https://uom-issues.onrender.com';
 const MAX_FILE_SIZE_MB = 50;
 
-function StartupOverlay({ show }) {
+function StartupOverlay({ show, dataLoaded, onClose }) {
   const [logs, setLogs] = useState([]);
   const [complete, setComplete] = useState(false);
   const [totalRows, setTotalRows] = useState(0);
   const [processedRows, setProcessedRows] = useState(0);
+  const [dataReady, setDataReady] = useState(dataLoaded);
   const logEndRef = useRef(null);
 
   useEffect(() => {
@@ -27,6 +28,9 @@ function StartupOverlay({ show }) {
         setProcessedRows(res.data.processed_rows || 0);
         const done = res.data.complete;
         setComplete(done);
+        if (done) {
+          setDataReady(res.data.data_loaded);
+        }
         return done;
       } catch {
         return false;
@@ -53,11 +57,59 @@ function StartupOverlay({ show }) {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
-  if (!show || complete) return null;
+  // Close overlay once data is loaded
+  if (!show) return null;
+  if (complete && dataReady) return null;
 
   const percentage = totalRows > 0
     ? Math.min(100, Math.round((processedRows / totalRows) * 100))
     : 0;
+
+  // Show "upload required" state when server is ready but no data loaded
+  if (complete && !dataReady) {
+    return (
+      <div className="fixed inset-0 z-50 bg-gray-900 bg-opacity-95 flex items-center justify-center p-4">
+        <div className="max-w-lg w-full text-center">
+          <div className="text-6xl mb-6">📂</div>
+          <h2 className="text-2xl font-bold text-white mb-3">No Data Loaded</h2>
+          <p className="text-gray-300 mb-6 leading-relaxed">
+            The server is running, but no GRN data file was found.<br />
+            Please upload a CSV file to get started.
+          </p>
+          <div className="bg-gray-950 rounded-xl border border-gray-700 overflow-hidden shadow-2xl text-left">
+            <div className="flex items-center space-x-2 px-4 py-2 bg-gray-800 border-b border-gray-700">
+              <Terminal className="w-4 h-4 text-gray-400" />
+              <span className="text-xs text-gray-400 font-mono">startup.log</span>
+            </div>
+            <div className="p-4 max-h-64 overflow-y-auto font-mono text-sm space-y-1">
+              {logs.map((log, i) => (
+                <div
+                  key={i}
+                  className={clsx(
+                    "opacity-90 leading-relaxed",
+                    log.includes("✓") ? "text-green-400" :
+                    log.includes("⚠") ? "text-yellow-400" :
+                    log.includes("✗") ? "text-red-400" :
+                    "text-gray-300"
+                  )}
+                >
+                  <span className="text-gray-500 mr-2">$</span>
+                  {log}
+                </div>
+              ))}
+              <div ref={logEndRef} />
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="mt-6 bg-indigo-600 hover:bg-indigo-700 text-white px-8 py-3 rounded-lg text-base font-medium transition-colors"
+          >
+            Got it — Show Upload Panel
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 z-50 bg-gray-900 bg-opacity-95 flex items-center justify-center p-4">
@@ -248,6 +300,7 @@ function App() {
   const [uploadMsg, setUploadMsg] = useState({ type: '', text: '' });
   const [uploadProgress, setUploadProgress] = useState(null);
   const [showStartupOverlay, setShowStartupOverlay] = useState(false);
+const [dataLoaded, setDataLoaded] = useState(false);
 
   const debounceTimeout = useRef(null);
   const pollTimeout = useRef(null);
@@ -259,6 +312,12 @@ function App() {
         const res = await axios.get(`${API_URL}/startup_logs`);
         if (!res.data.complete) {
           setShowStartupOverlay(true);
+        } else if (!res.data.data_loaded) {
+          // Server is up but no data loaded - keep overlay visible with upload prompt
+          setDataLoaded(false);
+          setShowStartupOverlay(true);
+        } else {
+          setDataLoaded(true);
         }
       } catch {
         // Server might be starting up, show overlay
@@ -450,7 +509,7 @@ function App() {
   return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
       {/* Startup loading overlay */}
-      <StartupOverlay show={showStartupOverlay} />
+      <StartupOverlay show={showStartupOverlay} dataLoaded={dataLoaded} onClose={() => setShowStartupOverlay(false)} />
 
       <div className="max-w-xl w-full bg-white rounded-xl shadow-lg overflow-hidden border border-gray-100">
         

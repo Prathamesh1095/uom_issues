@@ -42,6 +42,7 @@ upload_tasks = {}
 # Startup logs — accumulated during boot, exposed via API
 startup_logs = []
 startup_complete = False
+startup_data_loaded = False
 startup_total_rows = 0
 startup_processed_rows = 0
 
@@ -219,7 +220,7 @@ def build_sku_profiles_from_chunks(chunks, log_callback=None, known_total_rows=N
 async def load_startup_data_async():
     """Load data in background so server starts immediately."""
     global sku_profiles, global_df, startup_complete, startup_logs
-    global startup_processed_rows, startup_total_rows
+    global startup_processed_rows, startup_total_rows, startup_data_loaded
 
     add_startup_log("Starting background data loading...")
 
@@ -269,10 +270,12 @@ async def load_startup_data_async():
             )
 
         sku_profiles = await asyncio.to_thread(process)
-
+        startup_data_loaded = True
         add_startup_log(f"✓ Startup complete. Loaded profiles for {len(sku_profiles)} SKUs.")
     else:
-        add_startup_log(f"⚠ Data file not found at {file_path}. Place it in the configured path.")
+        startup_data_loaded = False
+        add_startup_log("⚠ No data file found on server. Please upload a CSV file to get started.")
+        add_startup_log("Use the 'Select CSV File' button below to upload your GRN data.")
 
     startup_complete = True
     add_startup_log("Server is ready.")
@@ -280,10 +283,11 @@ async def load_startup_data_async():
 
 @app.on_event("startup")
 def startup_event():
-    global startup_logs, startup_complete, startup_processed_rows, startup_total_rows
+    global startup_logs, startup_complete, startup_processed_rows, startup_total_rows, startup_data_loaded
 
     startup_logs = []
     startup_complete = False
+    startup_data_loaded = False
     startup_processed_rows = 0
     startup_total_rows = 0
 
@@ -293,11 +297,23 @@ def startup_event():
     asyncio.create_task(load_startup_data_async())
 
 
+@app.get("/")
+def root():
+    """Health check endpoint."""
+    return {
+        "status": "ok",
+        "data_loaded": startup_data_loaded,
+        "startup_complete": startup_complete,
+        "sku_count": len(sku_profiles)
+    }
+
+
 @app.get("/startup_logs")
 def get_startup_logs():
     """Return startup logs + status. Frontend polls this on mount."""
     return {
         "complete": startup_complete,
+        "data_loaded": startup_data_loaded,
         "logs": startup_logs,
         "total_rows": startup_total_rows,
         "processed_rows": startup_processed_rows
@@ -460,9 +476,10 @@ async def process_upload_async(task_id: str, file_path: str, total_rows: int):
         profiles = await asyncio.to_thread(process_in_thread)
         
         # Update global state
-        global sku_profiles, global_df
+        global sku_profiles, global_df, startup_data_loaded
         upload_log_callback(f"Updating system with {len(profiles)} SKU profiles...", total_rows, total_rows)
         sku_profiles = profiles
+        startup_data_loaded = True
         
         # Read first chunk as sample for global_df
         sample_df = pd.read_csv(file_path, nrows=5)
