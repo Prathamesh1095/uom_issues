@@ -3,7 +3,7 @@ import axios from 'axios';
 import { AlertTriangle, CheckCircle2, Download, Upload, FileDown, FileUp, Terminal } from 'lucide-react';
 import clsx from 'clsx';
 
-const API_URL = import.meta.env.VITE_API_URL || 'https://uom-issues.onrender.com';
+const API_URL = (import.meta.env.VITE_API_URL || 'https://uom-issues.onrender.com').replace(/\/+$/, '');
 const MAX_FILE_SIZE_MB = 50;
 
 function StartupOverlay({ show, dataLoaded, onClose }) {
