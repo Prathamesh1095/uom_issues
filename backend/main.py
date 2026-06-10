@@ -619,6 +619,19 @@ async def load_startup_data_async():
         else:
             add_startup_log("No raw data in database. Template download may be unavailable.")
 
+        # Check if outliers cache exists and has rows; if not, try to rebuild it
+        _, cached_row_count = load_outliers_cache()
+        if cached_row_count == 0:
+            add_startup_log("Outliers cache is empty or missing. Attempting to recompute...")
+            try:
+                csv_buf_recompute, _, _ = load_raw_csv_from_db()
+                if csv_buf_recompute:
+                    precompute_and_cache_outliers(csv_buf_recompute)
+                else:
+                    add_startup_log("⚠ Cannot recompute outliers: no raw CSV data in database.")
+            except Exception as e:
+                add_startup_log(f"⚠ Outliers recomputation failed during startup: {str(e)}")
+
         add_startup_log("Server is ready.")
         return
 
@@ -792,10 +805,38 @@ def predict_uom(req: PredictRequest):
 
 @app.get("/export_outliers")
 def export_outliers():
-    """Return precomputed Excel outliers report directly from DB cache."""
+    """Return precomputed Excel outliers report directly from DB cache.
+    If the cache is missing or has 0 rows, automatically recompute once to verify.
+    """
     excel_bytes, row_count = load_outliers_cache()
-    if excel_bytes is None:
-        return {"status": "error", "message": "Outliers report not yet computed. Please upload data first."}
+    
+    # If cache is missing or has 0 rows, try to recompute from raw data
+    if excel_bytes is None or row_count == 0:
+        # Load raw CSV from database and recompute outliers
+        csv_buf, _, _ = load_raw_csv_from_db()
+        if csv_buf is not None:
+            try:
+                outliers_df = compute_outliers_from_csv(csv_buf)
+                excel_buffer = io.BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                    outliers_df.to_excel(writer, index=False, sheet_name='Outliers')
+                excel_bytes_new = excel_buffer.getvalue()
+                row_count_new = len(outliers_df)
+                save_outliers_cache(excel_bytes_new, row_count_new)
+                excel_bytes = excel_bytes_new
+                row_count = row_count_new
+            except Exception as e:
+                return {"status": "error", "message": f"Failed to recompute outliers: {str(e)}"}
+        else:
+            return {"status": "error", "message": "No data available. Please upload a CSV file first."}
+    
+    # If still 0 rows after recomputation, return a proper empty Excel
+    if row_count == 0:
+        # Return an empty Excel file with the outliers sheet
+        empty_buffer = io.BytesIO()
+        with pd.ExcelWriter(empty_buffer, engine='openpyxl') as writer:
+            pd.DataFrame().to_excel(writer, index=False, sheet_name='Outliers')
+        excel_bytes = empty_buffer.getvalue()
     
     return Response(
         content=excel_bytes,
