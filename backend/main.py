@@ -501,11 +501,22 @@ def compute_outliers_from_csv(csv_source) -> pd.DataFrame:
     rename_map = {"PO Purchase Rate": "Price", "invoice_date": "Date"}
     grn_df.rename(columns=rename_map, inplace=True)
 
-    def get_implied_cf(text):
-        match = re.search(r'of\s+(\d+)', str(text), re.IGNORECASE)
-        return int(match.group(1)) if match else None
+    # [BUGFIX] Convert Price to numeric (matches streaming behavior in build_sku_profiles_from_chunks)
+    grn_df['Price'] = pd.to_numeric(grn_df['Price'], errors='coerce')
+    # [BUGFIX] Drop rows with unparseable prices
+    grn_df.dropna(subset=['Price'], inplace=True)
 
-    grn_df['Implied_CF'] = grn_df['alternate_uom'].apply(get_implied_cf)
+    # [BUGFIX] Default CF column if missing (matches streaming behavior)
+    if 'CF' not in grn_df.columns:
+        grn_df['CF'] = 1.0
+    # [BUGFIX] Ensure CF is numeric
+    grn_df['CF'] = pd.to_numeric(grn_df['CF'], errors='coerce').fillna(1.0)
+
+    # [BUGFIX] Use vectorized str.extract matching streaming function instead of .apply()
+    grn_df['Implied_CF'] = grn_df['alternate_uom'].str.extract(
+        r'of\s+(\d+)', flags=re.IGNORECASE, expand=False
+    ).astype(float)
+
     grn_df['Effective_CF'] = grn_df['Implied_CF'].fillna(grn_df['CF'])
     grn_df['Row_Base_Rate'] = grn_df['Price'] / grn_df['Effective_CF']
 
