@@ -672,17 +672,23 @@ def compute_sales_outliers(sales_csv_source) -> tuple:
     return outliers_df, loss_summary_df
 
 
-def precompute_and_cache_sales_outliers(csv_source):
+def precompute_and_cache_sales_outliers(csv_source, log_callback=None):
     """Compute sales outliers from CSV, cache both reports as Excel in DB. Returns (row_count, loss_row_count, bytes)."""
     global sales_outliers_progress, sales_loss_progress
     sales_outliers_progress = 0
     sales_loss_progress = 0
     try:
+        if log_callback:
+            log_callback("Computing sales outliers...", 0, None)
         outliers_df, loss_summary_df = compute_sales_outliers(csv_source)
         sales_outliers_progress = 30
         sales_loss_progress = 30
+        if log_callback:
+            log_callback(f"Found {len(outliers_df)} outlier rows, {len(loss_summary_df)} SKUs with loss.", 30, None)
 
         # Cache outliers Excel
+        if log_callback:
+            log_callback("Caching sales outliers report...", 40, None)
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
             outliers_df.to_excel(writer, index=False, sheet_name='Sales Outliers')
@@ -690,6 +696,8 @@ def precompute_and_cache_sales_outliers(csv_source):
         sales_outliers_progress = 60
 
         # Cache loss summary Excel
+        if log_callback:
+            log_callback("Caching sales loss summary report...", 70, None)
         excel_buffer2 = io.BytesIO()
         with pd.ExcelWriter(excel_buffer2, engine='openpyxl') as writer:
             loss_summary_df.to_excel(writer, index=False, sheet_name='Sales Loss Summary')
@@ -698,12 +706,16 @@ def precompute_and_cache_sales_outliers(csv_source):
 
         sales_outliers_progress = 100
         sales_loss_progress = 100
+        if log_callback:
+            log_callback(f"✓ Sales outliers and loss summary cached.", 100, None)
 
         return len(outliers_df), len(loss_summary_df)
     except Exception as e:
         add_startup_log(f"⚠ Sales outliers precomputation failed: {str(e)}")
         sales_outliers_progress = -1
         sales_loss_progress = -1
+        if log_callback:
+            log_callback(f"✗ Error: {str(e)}", 0, None)
         return 0, 0
 
 
@@ -1018,6 +1030,7 @@ async def load_startup_data_async():
             global_df = first_chunk.copy()
             startup_total_rows = row_count
             add_startup_log(f"Loaded sample ({row_count:,} rows total) from database.")
+            grn_template_available = True
         else:
             add_startup_log("No raw data in database. Template download may be unavailable.")
 
@@ -1033,6 +1046,10 @@ async def load_startup_data_async():
                     add_startup_log("⚠ Cannot recompute outliers: no raw CSV data in database.")
             except Exception as e:
                 add_startup_log(f"⚠ Outliers recomputation failed during startup: {str(e)}")
+        else:
+            # Cache exists and has rows — mark as ready
+            grn_outliers_progress = 100
+            add_startup_log(f"✓ Outliers cache loaded ({cached_row_count:,} rows).")
 
         add_startup_log("Server is ready.")
         return
@@ -1280,10 +1297,11 @@ async def process_upload_async(task_id: str, file_path: str, total_rows: int):
         profiles = await asyncio.to_thread(process_in_thread)
         
         # Update global state
-        global sku_profiles, global_df, startup_data_loaded
+        global sku_profiles, global_df, startup_data_loaded, grn_template_available
         upload_log_callback(f"Updating system with {len(profiles)} SKU profiles...", total_rows, total_rows)
         sku_profiles = profiles
         startup_data_loaded = True
+        grn_template_available = True
         
         # Read first chunk as sample for global_df
         sample_df = pd.read_csv(file_path, nrows=5)
@@ -1332,6 +1350,7 @@ async def process_upload_async(task_id: str, file_path: str, total_rows: int):
 async def process_sales_upload_async(task_id: str, file_path: str, total_rows: int):
     """Process a Sales CSV upload in the background.
     Validates against existing GRN SKU profiles and precomputes outliers.
+    Uses asyncio.to_thread to avoid blocking the event loop during CPU-bound work.
     """
     try:
         upload_tasks[task_id]["logs"].append(f"Starting to process sales data ({total_rows:,} rows)...")
@@ -1348,7 +1367,7 @@ async def process_sales_upload_async(task_id: str, file_path: str, total_rows: i
                 task["total_rows"] = total
                 task["percentage"] = min(99, int((processed / total) * 100))
 
-        # Read full CSV
+        # Read full CSV (I/O bound — fast)
         sales_log_callback(f"Reading sales file...", 0, total_rows)
         with open(file_path, 'rb') as f:
             csv_bytes = f.read()
@@ -1370,14 +1389,18 @@ async def process_sales_upload_async(task_id: str, file_path: str, total_rows: i
                 pass
             return
 
-        # Store sales raw data in DB
+        # Store sales raw data in DB (I/O bound — fast)
         sales_log_callback("Storing sales data in database...", total_rows // 2, total_rows)
         save_sales_data_to_db(csv_bytes, os.path.basename(file_path), total_rows)
 
-        # Compute sales outliers
+        # Compute sales outliers — CPU-bound, run in thread pool
         sales_log_callback("Computing sales outliers against GRN profiles...", total_rows, total_rows)
-        csv_buf = io.BytesIO(csv_bytes)
-        outlier_count, loss_count = precompute_and_cache_sales_outliers(csv_buf)
+
+        def compute_sales_in_thread():
+            csv_buf = io.BytesIO(csv_bytes)
+            return precompute_and_cache_sales_outliers(csv_buf, log_callback=sales_log_callback)
+
+        outlier_count, loss_count = await asyncio.to_thread(compute_sales_in_thread)
 
         # Clean up temp file
         try:

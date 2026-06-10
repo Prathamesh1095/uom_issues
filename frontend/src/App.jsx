@@ -686,7 +686,7 @@ function App() {
             </button>
             <button 
               onClick={handleExportSalesOutliers}
-              disabled={isExportingSales || isSalesOutliersComputing || isSalesOutliersReady === false || isCheckingExports}
+              disabled={isExportingSales || isSalesOutliersComputing || isCheckingExports}
               className={clsx(
                 "flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors",
                 isSalesOutliersComputing 
@@ -712,7 +712,7 @@ function App() {
             </button>
             <button 
               onClick={handleExportSalesLossSummary}
-              disabled={isExportingLoss || isSalesLossComputing || isSalesLossReady === false || isCheckingExports}
+              disabled={isExportingLoss || isSalesLossComputing || isCheckingExports}
               className={clsx(
                 "flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors",
                 isSalesLossComputing 
