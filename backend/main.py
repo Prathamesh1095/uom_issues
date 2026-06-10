@@ -10,7 +10,7 @@ import uuid
 import tempfile
 import time
 import sqlite3
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -1012,6 +1012,8 @@ async def load_startup_data_async():
     """Load data in background so server starts immediately. Checks DB first, then falls back to file."""
     global sku_profiles, global_df, startup_complete, startup_logs
     global startup_processed_rows, startup_total_rows, startup_data_loaded
+    global grn_outliers_progress, grn_template_available
+    global sales_outliers_progress, sales_loss_progress
 
     add_startup_log("Starting background data loading...")
 
@@ -1299,6 +1301,21 @@ async def process_upload_async(task_id: str, file_path: str, total_rows: int):
         # Update global state
         global sku_profiles, global_df, startup_data_loaded, grn_template_available
         upload_log_callback(f"Updating system with {len(profiles)} SKU profiles...", total_rows, total_rows)
+        if not profiles:
+            upload_logs_entry = upload_tasks[task_id]["logs"]
+            upload_logs_entry.append("✗ Error: No valid SKU profiles found in CSV. Missing required columns (SKU Code, Price).")
+            upload_tasks[task_id].update({
+                "status": "error",
+                "percentage": 0,
+                "processed_rows": total_rows,
+                "message": "Upload failed: CSV file has no valid SKU profiles. Please check that the file contains 'SKU Code' and 'Price' columns.",
+                "logs": upload_logs_entry
+            })
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            return
         sku_profiles = profiles
         startup_data_loaded = True
         grn_template_available = True
@@ -1429,7 +1446,7 @@ async def process_sales_upload_async(task_id: str, file_path: str, total_rows: i
 
 
 @app.post("/upload_data")
-async def upload_data(file: UploadFile = File(...), file_type: str = "grn"):
+async def upload_data(file: UploadFile = File(...), file_type: str = Form("grn")):
     global sku_profiles, global_df
     
     # Validate file extension

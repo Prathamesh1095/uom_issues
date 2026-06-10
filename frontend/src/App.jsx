@@ -622,9 +622,11 @@ function App() {
   
   const isSalesOutliersComputing = salesOutliersProgress >= 0 && salesOutliersProgress < 100;
   const isSalesOutliersReady = salesOutliersProgress === 100;
+  const isSalesOutliersUnavailable = salesOutliersProgress === -1;
   
   const isSalesLossComputing = salesLossProgress >= 0 && salesLossProgress < 100;
   const isSalesLossReady = salesLossProgress === 100;
+  const isSalesLossUnavailable = salesLossProgress === -1;
 
   const isTemplateDisabled = fileType === 'grn' ? !grnTemplateAvailable : !salesTemplateAvailable;
 
@@ -686,7 +688,7 @@ function App() {
             </button>
             <button 
               onClick={handleExportSalesOutliers}
-              disabled={isExportingSales || isSalesOutliersComputing || isCheckingExports}
+              disabled={isExportingSales || isSalesOutliersComputing || isSalesOutliersUnavailable || isCheckingExports}
               className={clsx(
                 "flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors",
                 isSalesOutliersComputing 
@@ -712,7 +714,7 @@ function App() {
             </button>
             <button 
               onClick={handleExportSalesLossSummary}
-              disabled={isExportingLoss || isSalesLossComputing || isCheckingExports}
+              disabled={isExportingLoss || isSalesLossComputing || isSalesLossUnavailable || isCheckingExports}
               className={clsx(
                 "flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors",
                 isSalesLossComputing 
