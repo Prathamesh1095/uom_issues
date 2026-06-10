@@ -139,7 +139,26 @@ def init_db():
                     excel_data BYTEA NOT NULL,
                     row_count INTEGER NOT NULL
                 );""",
-                """CREATE INDEX IF NOT EXISTS idx_sku_uoms_sku ON sku_uoms(sku_code);"""
+                """CREATE INDEX IF NOT EXISTS idx_sku_uoms_sku ON sku_uoms(sku_code);""",
+                """CREATE TABLE IF NOT EXISTS sales_data (
+                    id SERIAL PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    uploaded_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    row_count INTEGER NOT NULL,
+                    csv_content BYTEA NOT NULL
+                );""",
+                """CREATE TABLE IF NOT EXISTS sales_outliers_cache (
+                    id SERIAL PRIMARY KEY,
+                    generated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    excel_data BYTEA NOT NULL,
+                    row_count INTEGER NOT NULL
+                );""",
+                """CREATE TABLE IF NOT EXISTS sales_loss_summary_cache (
+                    id SERIAL PRIMARY KEY,
+                    generated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    excel_data BYTEA NOT NULL,
+                    row_count INTEGER NOT NULL
+                );""",
             ]
         else:
             statements = [
@@ -168,7 +187,26 @@ def init_db():
                     excel_data BLOB NOT NULL,
                     row_count INTEGER NOT NULL
                 );""",
-                """CREATE INDEX IF NOT EXISTS idx_sku_uoms_sku ON sku_uoms(sku_code);"""
+                """CREATE INDEX IF NOT EXISTS idx_sku_uoms_sku ON sku_uoms(sku_code);""",
+                """CREATE TABLE IF NOT EXISTS sales_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL,
+                    uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    row_count INTEGER NOT NULL,
+                    csv_content BLOB NOT NULL
+                );""",
+                """CREATE TABLE IF NOT EXISTS sales_outliers_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    excel_data BLOB NOT NULL,
+                    row_count INTEGER NOT NULL
+                );""",
+                """CREATE TABLE IF NOT EXISTS sales_loss_summary_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    excel_data BLOB NOT NULL,
+                    row_count INTEGER NOT NULL
+                );""",
             ]
         for stmt in statements:
             cur = get_cursor(conn)
@@ -320,6 +358,334 @@ def load_outliers_cache() -> tuple:
         return excel_bytes, row['row_count']
     finally:
         close_db(conn)
+
+
+# ─── Sales Data CRUD Helpers ────────────────────────────────────────────────────
+
+
+def save_sales_data_to_db(csv_bytes: bytes, filename: str, row_count: int):
+    """Replace sales_data table with new CSV content."""
+    conn = get_db()
+    try:
+        execute_sql(conn, "DELETE FROM sales_data").close()
+        if USE_POSTGRES:
+            execute_sql(conn,
+                "INSERT INTO sales_data (filename, row_count, csv_content) VALUES (%s, %s, %s)",
+                (filename, row_count, csv_bytes)
+            ).close()
+        else:
+            execute_sql(conn,
+                "INSERT INTO sales_data (filename, row_count, csv_content) VALUES (?, ?, ?)",
+                (filename, row_count, csv_bytes)
+            ).close()
+        conn.commit()
+    finally:
+        close_db(conn)
+
+
+def load_sales_csv_from_db():
+    """Load the stored Sales CSV content from DB. Returns (BytesIO, row_count) or (None, 0)."""
+    conn = get_db()
+    try:
+        cur = execute_sql(conn, "SELECT csv_content, row_count FROM sales_data ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        cur.close()
+        if row is None:
+            return None, 0
+        raw_bytes = row['csv_content']
+        if hasattr(raw_bytes, 'tobytes'):
+            csv_bytes = raw_bytes.tobytes()
+        elif isinstance(raw_bytes, memoryview):
+            csv_bytes = bytes(raw_bytes)
+        else:
+            csv_bytes = raw_bytes
+        return io.BytesIO(csv_bytes), row['row_count']
+    finally:
+        close_db(conn)
+
+
+def save_sales_outliers_cache(excel_bytes: bytes, row_count: int):
+    """Replace sales_outliers_cache with newly computed Excel data."""
+    conn = get_db()
+    try:
+        execute_sql(conn, "DELETE FROM sales_outliers_cache").close()
+        if USE_POSTGRES:
+            execute_sql(conn,
+                "INSERT INTO sales_outliers_cache (excel_data, row_count) VALUES (%s, %s)",
+                (excel_bytes, row_count)
+            ).close()
+        else:
+            execute_sql(conn,
+                "INSERT INTO sales_outliers_cache (excel_data, row_count) VALUES (?, ?)",
+                (excel_bytes, row_count)
+            ).close()
+        conn.commit()
+    finally:
+        close_db(conn)
+
+
+def load_sales_outliers_cache() -> tuple:
+    """Load cached Sales outliers Excel data. Returns (excel_bytes, row_count) or (None, 0)."""
+    conn = get_db()
+    try:
+        cur = execute_sql(conn, "SELECT excel_data, row_count FROM sales_outliers_cache ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        cur.close()
+        if row is None:
+            return None, 0
+        raw_bytes = row['excel_data']
+        if hasattr(raw_bytes, 'tobytes'):
+            excel_bytes = raw_bytes.tobytes()
+        elif isinstance(raw_bytes, memoryview):
+            excel_bytes = bytes(raw_bytes)
+        else:
+            excel_bytes = raw_bytes
+        return excel_bytes, row['row_count']
+    finally:
+        close_db(conn)
+
+
+def save_sales_loss_summary_cache(excel_bytes: bytes, row_count: int):
+    """Replace sales_loss_summary_cache with newly computed Excel data."""
+    conn = get_db()
+    try:
+        execute_sql(conn, "DELETE FROM sales_loss_summary_cache").close()
+        if USE_POSTGRES:
+            execute_sql(conn,
+                "INSERT INTO sales_loss_summary_cache (excel_data, row_count) VALUES (%s, %s)",
+                (excel_bytes, row_count)
+            ).close()
+        else:
+            execute_sql(conn,
+                "INSERT INTO sales_loss_summary_cache (excel_data, row_count) VALUES (?, ?)",
+                (excel_bytes, row_count)
+            ).close()
+        conn.commit()
+    finally:
+        close_db(conn)
+
+
+def load_sales_loss_summary_cache() -> tuple:
+    """Load cached Sales loss summary Excel data. Returns (excel_bytes, row_count) or (None, 0)."""
+    conn = get_db()
+    try:
+        cur = execute_sql(conn, "SELECT excel_data, row_count FROM sales_loss_summary_cache ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        cur.close()
+        if row is None:
+            return None, 0
+        raw_bytes = row['excel_data']
+        if hasattr(raw_bytes, 'tobytes'):
+            excel_bytes = raw_bytes.tobytes()
+        elif isinstance(raw_bytes, memoryview):
+            excel_bytes = bytes(raw_bytes)
+        else:
+            excel_bytes = raw_bytes
+        return excel_bytes, row['row_count']
+    finally:
+        close_db(conn)
+
+
+# ─── Sales Outlier Detection Logic ──────────────────────────────────────────────
+
+
+def compute_sales_outliers(sales_csv_source) -> tuple:
+    """
+    Compute sales outliers and loss summary from Sales CSV data, using existing GRN SKU profiles.
+
+    Returns (outliers_df, loss_summary_df) as pandas DataFrames.
+    """
+    # Read Sales CSV
+    if isinstance(sales_csv_source, str):
+        sales_df = pd.read_csv(sales_csv_source, low_memory=False)
+    else:
+        sales_df = pd.read_csv(sales_csv_source, low_memory=False)
+
+    required_cols = ['SKU Code', 'Sales Price', 'Sales UOM', 'Sales Qty']
+    missing = [c for c in required_cols if c not in sales_df.columns]
+    if missing:
+        raise ValueError(f"Sales CSV missing required columns: {missing}")
+
+    # Ensure numeric types
+    sales_df['Sales Price'] = pd.to_numeric(sales_df['Sales Price'], errors='coerce')
+    sales_df['Sales Qty'] = pd.to_numeric(sales_df['Sales Qty'], errors='coerce').fillna(0).astype(int)
+    sales_df.dropna(subset=['Sales Price'], inplace=True)
+
+    lower_mult = config.get("historical_data", {}).get("median_br_lower_multiplier", 0.6)
+    upper_mult = config.get("historical_data", {}).get("median_br_upper_multiplier", 3.0)
+
+    outliers_list = []
+    loss_summary = {}  # sku -> {'total_qty': 0, 'total_loss': 0.0, 'suggested_uoms': {}, 'count': 0}
+
+    total_rows = len(sales_df)
+    processed = 0
+
+    for _, row in sales_df.iterrows():
+        processed += 1
+        sku = str(row.get('SKU Code', '')).strip()
+        sales_uom = str(row.get('Sales UOM', '')).strip()
+        sales_price = row.get('Sales Price', 0)
+        sales_qty = int(row.get('Sales Qty', 0))
+        sales_date = row.get('Date', '')
+        order_id = row.get('Order ID', '')
+
+        # Skip if no SKU
+        if not sku:
+            continue
+
+        # Look up SKU in GRN profiles
+        profile = sku_profiles.get(sku)
+
+        # If SKU not found, mark as outlier with no loss calculation
+        if profile is None:
+            outliers_list.append({
+                'Date': sales_date,
+                'Order ID': order_id,
+                'SKU Code': sku,
+                'Sales UOM': sales_uom,
+                'Sales Qty': sales_qty,
+                'Actual Sales Price': sales_price,
+                'Expected Price (Correct UOM)': '',
+                'Suggested UOM': '',
+                'Suggested CF': '',
+                'Price Difference per Unit': '',
+                'Sales Loss': 0,
+                'Historical Median Base Rate': '',
+                'Outlier Reason': f'SKU "{sku}" not found in GRN historical profiles.'
+            })
+            continue
+
+        valid_uoms = profile['valid_uoms']  # {uom: cf, ...}
+        latest_br = profile['latest_br']
+
+        # If no valid UOMs defined, skip
+        if not valid_uoms:
+            continue
+
+        # Find the best matching UOM for this sales price
+        candidates = []
+        for uom, cf in valid_uoms.items():
+            exp_price = latest_br * cf
+            ratio = sales_price / exp_price if exp_price > 0 else 0
+            score = abs(math.log(ratio)) if ratio > 0 else float('inf')
+            candidates.append({'uom': uom, 'cf': cf, 'expected_price': exp_price, 'score': score})
+
+        candidates.sort(key=lambda x: x['score'])
+        best_match = candidates[0]
+
+        is_outlier = False
+        reason_parts = []
+
+        # Check if Sales UOM is in valid UOMs
+        if sales_uom in valid_uoms:
+            cf = valid_uoms[sales_uom]
+            expected_price = latest_br * cf
+            lower_bound = expected_price * lower_mult
+            upper_bound = expected_price * upper_mult
+
+            if sales_price < lower_bound or sales_price > upper_bound:
+                is_outlier = True
+                reason_parts.append(
+                    f"Price {sales_price:.2f} is outside expected range [{lower_bound:.2f}, {upper_bound:.2f}] "
+                    f"for UOM='{sales_uom}' (CF={cf})."
+                )
+        else:
+            is_outlier = True
+            reason_parts.append(
+                f"UOM '{sales_uom}' not found in GRN valid UOMs for SKU '{sku}'. "
+                f"Valid UOMs: {', '.join(valid_uoms.keys())}"
+            )
+
+        if not is_outlier:
+            continue
+
+        # Calculate expected price using closest matching UOM
+        correct_expected_price = best_match['expected_price']
+        suggested_uom = best_match['uom']
+        suggested_cf = best_match['cf']
+
+        # Sales loss: only count when selling below the correct expected price
+        price_diff = correct_expected_price - sales_price
+        sales_loss = max(0, round(price_diff * sales_qty, 2))
+
+        reason_parts.append(
+            f"Closest valid UOM is '{suggested_uom}' (CF={suggested_cf}, expected price={correct_expected_price:.2f})."
+        )
+        reason = " | ".join(reason_parts)
+
+        outliers_list.append({
+            'Date': sales_date,
+            'Order ID': order_id,
+            'SKU Code': sku,
+            'Sales UOM': sales_uom,
+            'Sales Qty': sales_qty,
+            'Actual Sales Price': sales_price,
+            'Expected Price (Correct UOM)': round(correct_expected_price, 2),
+            'Suggested UOM': suggested_uom,
+            'Suggested CF': suggested_cf,
+            'Price Difference per Unit': round(price_diff, 2),
+            'Sales Loss': sales_loss,
+            'Historical Median Base Rate': round(latest_br, 4),
+            'Outlier Reason': reason
+        })
+
+        # Accumulate summary per SKU
+        if sku not in loss_summary:
+            loss_summary[sku] = {
+                'total_qty': 0,
+                'total_loss': 0.0,
+                'suggested_uoms': {},
+                'count': 0,
+                'most_common_sales_uom': sales_uom
+            }
+        loss_summary[sku]['total_qty'] += sales_qty
+        loss_summary[sku]['total_loss'] += sales_loss
+        loss_summary[sku]['count'] += 1
+        loss_summary[sku]['suggested_uoms'][suggested_uom] = loss_summary[sku]['suggested_uoms'].get(suggested_uom, 0) + 1
+
+    outliers_df = pd.DataFrame(outliers_list)
+
+    # Build summary DataFrame
+    summary_rows = []
+    for sku, summary in loss_summary.items():
+        # Find most common suggested UOM
+        most_common_uom = max(summary['suggested_uoms'], key=summary['suggested_uoms'].get) if summary['suggested_uoms'] else ''
+        summary_rows.append({
+            'SKU Code': sku,
+            'Total Units Sold at Wrong UOM/Price': summary['total_qty'],
+            'Total Sales Loss': round(summary['total_loss'], 2),
+            'Outlier Transaction Count': summary['count'],
+            'Most Common Suggested UOM': most_common_uom
+        })
+
+    loss_summary_df = pd.DataFrame(summary_rows)
+    if not loss_summary_df.empty:
+        loss_summary_df = loss_summary_df.sort_values('Total Sales Loss', ascending=False)
+
+    return outliers_df, loss_summary_df
+
+
+def precompute_and_cache_sales_outliers(csv_source):
+    """Compute sales outliers from CSV, cache both reports as Excel in DB. Returns (row_count, loss_row_count, bytes)."""
+    try:
+        outliers_df, loss_summary_df = compute_sales_outliers(csv_source)
+
+        # Cache outliers Excel
+        excel_buffer = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+            outliers_df.to_excel(writer, index=False, sheet_name='Sales Outliers')
+        save_sales_outliers_cache(excel_buffer.getvalue(), len(outliers_df))
+
+        # Cache loss summary Excel
+        excel_buffer2 = io.BytesIO()
+        with pd.ExcelWriter(excel_buffer2, engine='openpyxl') as writer:
+            loss_summary_df.to_excel(writer, index=False, sheet_name='Sales Loss Summary')
+        save_sales_loss_summary_cache(excel_buffer2.getvalue(), len(loss_summary_df))
+
+        return len(outliers_df), len(loss_summary_df)
+    except Exception as e:
+        add_startup_log(f"⚠ Sales outliers precomputation failed: {str(e)}")
+        return 0, 0
 
 
 def add_startup_log(message, processed=None, total=None):
@@ -857,7 +1223,7 @@ def export_outliers():
 
 
 async def process_upload_async(task_id: str, file_path: str, total_rows: int):
-    """Process a large upload file in the background with progress tracking.
+    """Process a large GRN upload file in the background with progress tracking.
     Uses asyncio.to_thread to avoid blocking the event loop.
     Also stores raw data in DB and precomputes outliers.
     """
@@ -936,13 +1302,93 @@ async def process_upload_async(task_id: str, file_path: str, total_rows: int):
         })
 
 
+async def process_sales_upload_async(task_id: str, file_path: str, total_rows: int):
+    """Process a Sales CSV upload in the background.
+    Validates against existing GRN SKU profiles and precomputes outliers.
+    """
+    try:
+        upload_tasks[task_id]["logs"].append(f"Starting to process sales data ({total_rows:,} rows)...")
+
+        def sales_log_callback(msg, processed, total):
+            task = upload_tasks.get(task_id)
+            if task is None:
+                return
+            task["logs"].append(msg)
+            if len(task["logs"]) > 100:
+                task["logs"] = task["logs"][-100:]
+            task["processed_rows"] = processed
+            if total:
+                task["total_rows"] = total
+                task["percentage"] = min(99, int((processed / total) * 100))
+
+        # Read full CSV
+        sales_log_callback(f"Reading sales file...", 0, total_rows)
+        with open(file_path, 'rb') as f:
+            csv_bytes = f.read()
+
+        # Validate GRN profiles exist
+        global sku_profiles
+        if not sku_profiles:
+            sales_log_callback("⚠ No GRN profiles loaded. Sales outliers cannot be computed.", total_rows, total_rows)
+            upload_tasks[task_id].update({
+                "status": "error",
+                "percentage": 100,
+                "processed_rows": total_rows,
+                "message": "No GRN profiles available. Please upload GRN data first.",
+                "logs": upload_tasks[task_id]["logs"] + [f"✗ Aborted: No GRN profiles found."]
+            })
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            return
+
+        # Store sales raw data in DB
+        sales_log_callback("Storing sales data in database...", total_rows // 2, total_rows)
+        save_sales_data_to_db(csv_bytes, os.path.basename(file_path), total_rows)
+
+        # Compute sales outliers
+        sales_log_callback("Computing sales outliers against GRN profiles...", total_rows, total_rows)
+        csv_buf = io.BytesIO(csv_bytes)
+        outlier_count, loss_count = precompute_and_cache_sales_outliers(csv_buf)
+
+        # Clean up temp file
+        try:
+            os.remove(file_path)
+        except:
+            pass
+
+        upload_tasks[task_id].update({
+            "status": "success",
+            "percentage": 100,
+            "processed_rows": total_rows,
+            "message": f"Sales data processed: {total_rows:,} rows analyzed. Outliers: {outlier_count:,}, SKUs with loss: {loss_count:,}.",
+            "logs": upload_tasks[task_id]["logs"] + [
+                f"✓ Sales data stored ({len(csv_bytes):,} bytes).",
+                f"✓ Sales outliers computed ({outlier_count:,} rows).",
+                f"✓ Sales loss summary cached ({loss_count:,} SKUs)."
+            ]
+        })
+    except Exception as e:
+        upload_tasks[task_id].update({
+            "status": "error",
+            "percentage": 0,
+            "message": f"Failed to process sales file: {str(e)}",
+            "logs": upload_tasks[task_id].get("logs", []) + [f"✗ Error: {str(e)}"]
+        })
+
+
 @app.post("/upload_data")
-async def upload_data(file: UploadFile = File(...)):
+async def upload_data(file: UploadFile = File(...), file_type: str = "grn"):
     global sku_profiles, global_df
     
     # Validate file extension
     if not file.filename.endswith('.csv'):
         return {"status": "error", "message": "Only .csv files are accepted. Please upload a CSV file."}
+    
+    # Validate file_type
+    if file_type not in ("grn", "sales"):
+        return {"status": "error", "message": "Invalid file_type. Use 'grn' for GRN/PO data or 'sales' for Sales data."}
     
     try:
         # Read file content
@@ -958,7 +1404,7 @@ async def upload_data(file: UploadFile = File(...)):
         
         # Save to temp file
         temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, f"grn_upload_{task_id}.csv")
+        temp_path = os.path.join(temp_dir, f"{file_type}_upload_{task_id}.csv")
         with open(temp_path, 'wb') as f:
             f.write(contents)
         
@@ -968,17 +1414,22 @@ async def upload_data(file: UploadFile = File(...)):
             "percentage": 0,
             "processed_rows": 0,
             "total_rows": row_count,
+            "file_type": file_type,
             "message": f"Queued {row_count:,} rows for processing...",
-            "logs": [f"File received: {file.filename} ({row_count:,} rows)", "Queued for background processing..."]
+            "logs": [f"File received: {file.filename} ({row_count:,} rows, type={file_type})", "Queued for background processing..."]
         }
         
-        # Launch background processing (always async for consistency)
-        asyncio.create_task(process_upload_async(task_id, temp_path, row_count))
+        # Launch background processing based on type
+        if file_type == "sales":
+            asyncio.create_task(process_sales_upload_async(task_id, temp_path, row_count))
+        else:
+            asyncio.create_task(process_upload_async(task_id, temp_path, row_count))
         
         return {
             "status": "accepted",
             "task_id": task_id,
-            "message": f"File with {row_count:,} rows is being processed in the background."
+            "file_type": file_type,
+            "message": f"{'Sales' if file_type == 'sales' else 'GRN'} file with {row_count:,} rows is being processed in the background."
         }
             
     except Exception as e:
@@ -1019,3 +1470,119 @@ def download_template():
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=grn_template.csv"}
     )
+
+
+# ─── Sales API Endpoints ────────────────────────────────────────────────────────
+
+
+@app.get("/export_sales_outliers")
+def export_sales_outliers():
+    """Return precomputed Sales outliers Excel report from DB cache."""
+    excel_bytes, row_count = load_sales_outliers_cache()
+    
+    # If cache is missing, try to recompute from sales raw data
+    if excel_bytes is None or row_count == 0:
+        csv_buf, csv_row_count = load_sales_csv_from_db()
+        if csv_buf is not None and sku_profiles:
+            try:
+                precompute_and_cache_sales_outliers(csv_buf)
+                excel_bytes, row_count = load_sales_outliers_cache()
+            except Exception as e:
+                return {"status": "error", "message": f"Failed to recompute sales outliers: {str(e)}"}
+        else:
+            msg = "No sales data available." if csv_buf is None else "No GRN profiles loaded. Upload GRN data first."
+            return {"status": "error", "message": msg}
+    
+    if row_count == 0:
+        empty_buffer = io.BytesIO()
+        with pd.ExcelWriter(empty_buffer, engine='openpyxl') as writer:
+            pd.DataFrame().to_excel(writer, index=False, sheet_name='Sales Outliers')
+        excel_bytes = empty_buffer.getvalue()
+    
+    return Response(
+        content=excel_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=sales_outliers_report.xlsx"}
+    )
+
+
+@app.get("/export_sales_loss_summary")
+def export_sales_loss_summary():
+    """Return precomputed Sales Loss Summary Excel report from DB cache."""
+    excel_bytes, row_count = load_sales_loss_summary_cache()
+    
+    if excel_bytes is None or row_count == 0:
+        csv_buf, csv_row_count = load_sales_csv_from_db()
+        if csv_buf is not None and sku_profiles:
+            try:
+                precompute_and_cache_sales_outliers(csv_buf)
+                excel_bytes, row_count = load_sales_loss_summary_cache()
+            except Exception as e:
+                return {"status": "error", "message": f"Failed to recompute sales loss summary: {str(e)}"}
+        else:
+            msg = "No sales data available." if csv_buf is None else "No GRN profiles loaded. Upload GRN data first."
+            return {"status": "error", "message": msg}
+    
+    if row_count == 0:
+        empty_buffer = io.BytesIO()
+        with pd.ExcelWriter(empty_buffer, engine='openpyxl') as writer:
+            pd.DataFrame().to_excel(writer, index=False, sheet_name='Sales Loss Summary')
+        excel_bytes = empty_buffer.getvalue()
+    
+    return Response(
+        content=excel_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=sales_loss_summary.xlsx"}
+    )
+
+
+@app.get("/sales_analysis_summary")
+def sales_analysis_summary():
+    """Return JSON summary of sales data analysis."""
+    csv_buf, csv_row_count = load_sales_csv_from_db()
+    if csv_buf is None:
+        return {
+            "has_sales_data": False,
+            "total_sales_rows": 0,
+            "outlier_count": 0,
+            "sku_count": 0,
+            "total_units_lost": 0,
+            "total_sales_loss": 0.0,
+            "message": "No sales data uploaded yet."
+        }
+    
+    # Recompute from cache or recompute
+    excel_bytes, outlier_count = load_sales_outliers_cache()
+    if excel_bytes is None or outlier_count == 0:
+        if sku_profiles:
+            try:
+                csv_buf_for_recompute, _ = load_sales_csv_from_db()
+                precompute_and_cache_sales_outliers(csv_buf_for_recompute)
+                _, outlier_count = load_sales_outliers_cache()
+            except Exception:
+                pass
+    
+    # Get loss summary to compute totals
+    summary_excel, summary_count = load_sales_loss_summary_cache()
+    total_units = 0
+    total_loss = 0.0
+    loss_sku_count = 0
+    
+    if summary_count > 0 and summary_excel is not None:
+        try:
+            summary_df = pd.read_excel(io.BytesIO(summary_excel), sheet_name='Sales Loss Summary')
+            if not summary_df.empty:
+                total_units = int(summary_df['Total Units Sold at Wrong UOM/Price'].sum())
+                total_loss = float(summary_df['Total Sales Loss'].sum())
+                loss_sku_count = len(summary_df)
+        except Exception:
+            pass
+    
+    return {
+        "has_sales_data": True,
+        "total_sales_rows": csv_row_count,
+        "outlier_count": outlier_count,
+        "sku_count": loss_sku_count,
+        "total_units_lost": total_units,
+        "total_sales_loss": round(total_loss, 2)
+    }

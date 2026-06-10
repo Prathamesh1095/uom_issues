@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
-import { AlertTriangle, CheckCircle2, Download, Upload, FileDown, FileUp, Terminal } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Download, Upload, FileDown, FileUp, Terminal, BarChart3, DollarSign, Package, TrendingDown } from 'lucide-react';
 import clsx from 'clsx';
 
 const API_URL = (import.meta.env.VITE_API_URL || 'https://uom-issues.onrender.com').replace(/\/+$/, '');
@@ -294,13 +294,18 @@ function App() {
   const [flashGreen, setFlashGreen] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [isExportingSales, setIsExportingSales] = useState(false);
+  const [isExportingLoss, setIsExportingLoss] = useState(false);
   
   const [selectedFile, setSelectedFile] = useState(null);
+  const [fileType, setFileType] = useState('grn'); // 'grn' or 'sales'
   const [isUploading, setIsUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState({ type: '', text: '' });
   const [uploadProgress, setUploadProgress] = useState(null);
   const [showStartupOverlay, setShowStartupOverlay] = useState(false);
-const [dataLoaded, setDataLoaded] = useState(false);
+  const [dataLoaded, setDataLoaded] = useState(false);
+  const [salesSummary, setSalesSummary] = useState(null);
+  const [isFetchingSummary, setIsFetchingSummary] = useState(false);
 
   const debounceTimeout = useRef(null);
   const pollTimeout = useRef(null);
@@ -313,25 +318,35 @@ const [dataLoaded, setDataLoaded] = useState(false);
         if (!res.data.complete) {
           setShowStartupOverlay(true);
         } else if (!res.data.data_loaded) {
-          // Server is up but no data loaded - keep overlay visible with upload prompt
           setDataLoaded(false);
           setShowStartupOverlay(true);
         } else {
           setDataLoaded(true);
+          fetchSalesSummary();
         }
       } catch {
-        // Server might be starting up, show overlay
         setShowStartupOverlay(true);
       }
     };
     checkServer();
   }, []);
 
+  const fetchSalesSummary = async () => {
+    try {
+      setIsFetchingSummary(true);
+      const res = await axios.get(`${API_URL}/sales_analysis_summary`);
+      setSalesSummary(res.data);
+    } catch {
+      // Silently fail - summary may not be available yet
+    } finally {
+      setIsFetchingSummary(false);
+    }
+  };
+
   const handleFileChange = (e) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
       
-      // File size validation
       if (file.size > MAX_FILE_SIZE_MB * 1024 * 1024) {
         setUploadMsg({ 
           type: 'error', 
@@ -352,7 +367,6 @@ const [dataLoaded, setDataLoaded] = useState(false);
         const response = await axios.get(`${API_URL}/upload_status/${taskId}`);
         const data = response.data;
 
-        // Update progress state
         setUploadProgress(data);
 
         if (data.status === 'success' || data.status === 'error') {
@@ -361,10 +375,14 @@ const [dataLoaded, setDataLoaded] = useState(false);
             text: data.message
           });
           setIsUploading(false);
+          
+          // Refresh sales summary if sales data was uploaded
+          if (data.file_type === 'sales') {
+            fetchSalesSummary();
+          }
           return;
         }
 
-        // Continue polling every 2 seconds
         pollTimeout.current = setTimeout(poll, 2000);
       } catch (error) {
         console.error("Error polling upload status:", error);
@@ -384,6 +402,7 @@ const [dataLoaded, setDataLoaded] = useState(false);
     
     const formData = new FormData();
     formData.append('file', selectedFile);
+    formData.append('file_type', fileType);
     
     try {
       const response = await axios.post(`${API_URL}/upload_data`, formData, {
@@ -395,8 +414,8 @@ const [dataLoaded, setDataLoaded] = useState(false);
       if (response.data.status === 'success') {
         setUploadMsg({ type: 'success', text: response.data.message });
         setIsUploading(false);
+        if (fileType === 'sales') fetchSalesSummary();
       } else if (response.data.status === 'accepted') {
-        // Async upload - start polling
         setUploadMsg({ type: 'info', text: response.data.message });
         pollUploadStatus(response.data.task_id);
       } else {
@@ -433,9 +452,8 @@ const [dataLoaded, setDataLoaded] = useState(false);
     setIsExporting(true);
     try {
       const response = await axios.get(`${API_URL}/export_outliers`, {
-        responseType: 'blob', // Important for downloading files
+        responseType: 'blob',
       });
-      
       const url = window.URL.createObjectURL(new Blob([response.data]));
       const link = document.createElement('a');
       link.href = url;
@@ -446,9 +464,53 @@ const [dataLoaded, setDataLoaded] = useState(false);
       window.URL.revokeObjectURL(url);
     } catch (error) {
       console.error("Error exporting outliers:", error);
-      alert("Failed to export outliers. Ensure backend is running and data is loaded.");
+      alert("Failed to export outliers.");
     } finally {
       setIsExporting(false);
+    }
+  };
+
+  const handleExportSalesOutliers = async () => {
+    setIsExportingSales(true);
+    try {
+      const response = await axios.get(`${API_URL}/export_sales_outliers`, {
+        responseType: 'blob',
+      });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', 'sales_outliers_report.xlsx');
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error("Error exporting sales outliers:", error);
+      alert("Failed to export sales outliers.");
+    } finally {
+      setIsExportingSales(false);
+    }
+  };
+
+  const handleExportSalesLossSummary = async () => {
+    setIsExportingLoss(true);
+    try {
+      const response = await axios.get(`${API_URL}/export_sales_loss_summary`, {
+        responseType: 'blob',
+      });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', 'sales_loss_summary.xlsx');
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error("Error exporting sales loss summary:", error);
+      alert("Failed to export sales loss summary.");
+    } finally {
+      setIsExportingLoss(false);
     }
   };
 
@@ -475,8 +537,7 @@ const [dataLoaded, setDataLoaded] = useState(false);
           setSystemCf(data.cf);
           setErrorMsg('');
           setFlashGreen(true);
-          
-          setTimeout(() => setFlashGreen(false), 2000); // Flash duration
+          setTimeout(() => setFlashGreen(false), 2000);
         } else {
           setSystemUom('');
           setSystemCf('');
@@ -506,50 +567,115 @@ const [dataLoaded, setDataLoaded] = useState(false);
     setUploadProgress(null);
   };
 
+  const formatCurrency = (value) => {
+    if (value == null || value === '') return '₹0';
+    return '₹' + Number(value).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  };
+
   return (
-    <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
-      {/* Startup loading overlay */}
+    <div className="min-h-screen bg-gray-50 flex items-start justify-center p-4 pt-8">
       <StartupOverlay show={showStartupOverlay} dataLoaded={dataLoaded} onClose={() => setShowStartupOverlay(false)} />
 
-      <div className="max-w-xl w-full bg-white rounded-xl shadow-lg overflow-hidden border border-gray-100">
+      <div className="max-w-2xl w-full bg-white rounded-xl shadow-lg overflow-hidden border border-gray-100 space-y-0">
         
         {/* Header */}
-        <div className="bg-slate-900 px-6 py-5 border-b border-gray-200 flex items-center justify-between">
-          <div className="flex items-center space-x-4">
+        <div className="bg-slate-900 px-6 py-5 border-b border-gray-200">
+          <div className="flex items-center justify-between mb-3">
             <h1 className="text-xl font-bold text-white tracking-wide">Smart GRN Entry</h1>
-            {isLoading && (
-              <div className="w-5 h-5 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin"></div>
-            )}
+            <div className="flex items-center space-x-2">
+              {isLoading && (
+                <div className="w-5 h-5 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin"></div>
+              )}
+            </div>
           </div>
           
-          <div className="flex items-center space-x-3">
+          {/* Export buttons row */}
+          <div className="flex flex-wrap gap-2">
             <button 
               onClick={handleDownloadTemplate}
-              className="flex items-center space-x-2 bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
+              className="flex items-center space-x-1.5 bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
             >
-              <FileDown className="w-4 h-4" />
+              <FileDown className="w-3.5 h-3.5" />
               <span>Template</span>
             </button>
             <button 
               onClick={handleExportOutliers}
-            disabled={isExporting}
-            className="flex items-center space-x-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-          >
-            {isExporting ? (
-               <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
-            ) : (
-              <Download className="w-4 h-4" />
-            )}
-            <span>Export Outliers</span>
-          </button>
+              disabled={isExporting}
+              className="flex items-center space-x-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+            >
+              {isExporting ? (
+                <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+              ) : (
+                <Download className="w-3.5 h-3.5" />
+              )}
+              <span>GRN Outliers</span>
+            </button>
+            <button 
+              onClick={handleExportSalesOutliers}
+              disabled={isExportingSales}
+              className="flex items-center space-x-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+            >
+              {isExportingSales ? (
+                <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+              ) : (
+                <Download className="w-3.5 h-3.5" />
+              )}
+              <span>Sales Outliers</span>
+            </button>
+            <button 
+              onClick={handleExportSalesLossSummary}
+              disabled={isExportingLoss}
+              className="flex items-center space-x-1.5 bg-amber-600 hover:bg-amber-700 disabled:bg-amber-400 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+            >
+              {isExportingLoss ? (
+                <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+              ) : (
+                <Download className="w-3.5 h-3.5" />
+              )}
+              <span>Loss Summary</span>
+            </button>
           </div>
         </div>
 
         {/* Upload Section */}
         <div className="bg-slate-50 px-6 py-4 border-b border-gray-200">
+          {/* File Type Selector */}
+          <div className="flex items-center space-x-4 mb-3">
+            <span className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Data Type:</span>
+            <div className="flex space-x-1 bg-gray-200 rounded-lg p-0.5">
+              <button
+                onClick={() => setFileType('grn')}
+                className={clsx(
+                  "px-3 py-1.5 rounded-md text-xs font-medium transition-all",
+                  fileType === 'grn'
+                    ? "bg-white text-indigo-700 shadow-sm"
+                    : "text-gray-500 hover:text-gray-700"
+                )}
+              >
+                PO / GRN Data
+              </button>
+              <button
+                onClick={() => setFileType('sales')}
+                className={clsx(
+                  "px-3 py-1.5 rounded-md text-xs font-medium transition-all",
+                  fileType === 'sales'
+                    ? "bg-white text-emerald-700 shadow-sm"
+                    : "text-gray-500 hover:text-gray-700"
+                )}
+              >
+                Sales Data
+              </button>
+            </div>
+          </div>
+
           <div className="flex items-center justify-between">
             <div className="flex items-center space-x-3 w-full max-w-md">
-              <label className="flex-1 cursor-pointer bg-white border border-gray-300 hover:border-indigo-500 rounded-lg px-4 py-2 text-sm text-gray-600 transition-colors flex items-center justify-center">
+              <label className={clsx(
+                "flex-1 cursor-pointer border rounded-lg px-4 py-2 text-sm transition-colors flex items-center justify-center",
+                fileType === 'sales'
+                  ? "bg-white border-emerald-300 hover:border-emerald-500 text-gray-600"
+                  : "bg-white border-gray-300 hover:border-indigo-500 text-gray-600"
+              )}>
                 <FileUp className="w-4 h-4 mr-2 text-gray-400" />
                 <span className="truncate">{selectedFile ? selectedFile.name : "Select CSV File..."}</span>
                 <input 
@@ -562,7 +688,12 @@ const [dataLoaded, setDataLoaded] = useState(false);
               <button
                 onClick={handleUpload}
                 disabled={!selectedFile || isUploading}
-                className="bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center"
+                className={clsx(
+                  "text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center",
+                  fileType === 'sales'
+                    ? "bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400"
+                    : "bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400"
+                )}
               >
                 {isUploading ? (
                    <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2"></div>
@@ -574,10 +705,8 @@ const [dataLoaded, setDataLoaded] = useState(false);
             </div>
           </div>
           
-          {/* Upload progress bar + logs */}
           <UploadProgress progress={uploadProgress} onDismiss={handleDismissProgress} />
 
-          {/* Status message for non-progress messages */}
           {uploadMsg.text && !uploadProgress && (
             <div className={clsx(
               "mt-3 p-3 rounded-lg text-sm font-medium animate-in fade-in flex items-center",
@@ -593,10 +722,56 @@ const [dataLoaded, setDataLoaded] = useState(false);
           )}
         </div>
 
+        {/* Sales Analysis Summary Card */}
+        {salesSummary && salesSummary.has_sales_data && (
+          <div className="bg-gradient-to-r from-emerald-50 to-teal-50 px-6 py-4 border-b border-emerald-100">
+            <div className="flex items-center space-x-2 mb-3">
+              <BarChart3 className="w-4 h-4 text-emerald-600" />
+              <h3 className="text-sm font-bold text-emerald-800 uppercase tracking-wider">Sales Data Analysis</h3>
+              <button
+                onClick={fetchSalesSummary}
+                disabled={isFetchingSummary}
+                className="ml-auto text-xs text-emerald-500 hover:text-emerald-700"
+              >
+                {isFetchingSummary ? '⟳' : '↻'}
+              </button>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="bg-white rounded-lg p-3 border border-emerald-100">
+                <div className="flex items-center space-x-1.5 text-emerald-600 mb-1">
+                  <Package className="w-3.5 h-3.5" />
+                  <span className="text-xs font-medium">Outliers</span>
+                </div>
+                <p className="text-lg font-bold text-gray-800">{(salesSummary.outlier_count || 0).toLocaleString()}</p>
+              </div>
+              <div className="bg-white rounded-lg p-3 border border-emerald-100">
+                <div className="flex items-center space-x-1.5 text-emerald-600 mb-1">
+                  <TrendingDown className="w-3.5 h-3.5" />
+                  <span className="text-xs font-medium">Units Lost</span>
+                </div>
+                <p className="text-lg font-bold text-gray-800">{(salesSummary.total_units_lost || 0).toLocaleString()}</p>
+              </div>
+              <div className="bg-white rounded-lg p-3 border border-emerald-100">
+                <div className="flex items-center space-x-1.5 text-emerald-600 mb-1">
+                  <Package className="w-3.5 h-3.5" />
+                  <span className="text-xs font-medium">SKUs Affected</span>
+                </div>
+                <p className="text-lg font-bold text-gray-800">{(salesSummary.sku_count || 0).toLocaleString()}</p>
+              </div>
+              <div className="bg-white rounded-lg p-3 border border-emerald-100">
+                <div className="flex items-center space-x-1.5 text-emerald-600 mb-1">
+                  <DollarSign className="w-3.5 h-3.5" />
+                  <span className="text-xs font-medium">Sales Loss</span>
+                </div>
+                <p className="text-lg font-bold text-red-600">{formatCurrency(salesSummary.total_sales_loss)}</p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Form Content */}
         <div className="p-6 space-y-6">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
-            {/* SKU Input */}
             <div className="space-y-1.5">
               <label htmlFor="skuCode" className="block text-sm font-semibold text-gray-700">SKU Code</label>
               <input
@@ -609,7 +784,6 @@ const [dataLoaded, setDataLoaded] = useState(false);
               />
             </div>
 
-            {/* Price Input */}
             <div className="space-y-1.5">
               <label htmlFor="inputPrice" className="block text-sm font-semibold text-gray-700">Entered Price (Total)</label>
               <input
@@ -626,7 +800,6 @@ const [dataLoaded, setDataLoaded] = useState(false);
 
           <hr className="border-gray-100" />
 
-          {/* System Outputs */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
             <div className="space-y-1.5">
               <label htmlFor="systemUom" className="block text-sm font-semibold text-gray-500">System UOM</label>
@@ -659,7 +832,6 @@ const [dataLoaded, setDataLoaded] = useState(false);
             </div>
           </div>
 
-          {/* Visual Feedback Alerts */}
           {flashGreen && !errorMsg && (
             <div className="mt-4 flex items-center text-green-700 bg-green-50 border border-green-200 rounded-lg p-3 animate-in fade-in slide-in-from-top-2">
               <CheckCircle2 className="w-5 h-5 mr-2" />
