@@ -16,6 +16,18 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 
+# PostgreSQL support
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
+
+# Load .env for local development (DATABASE_URL, etc.)
+from dotenv import load_dotenv
+load_dotenv()
+
 app = FastAPI(title="Supply Chain GRN Smart Entry System")
 
 # Load configuration
@@ -34,6 +46,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Database connection config
+DATABASE_URL = os.environ.get("DATABASE_URL")
+USE_POSTGRES = bool(DATABASE_URL and HAS_PSYCOPG2)
 DB_PATH = os.path.join(os.path.dirname(__file__), 'data.db')
 
 sku_profiles = {}
@@ -56,96 +71,188 @@ class PredictRequest(BaseModel):
 
 
 def get_db():
-    """Get a SQLite connection (thread-safe with check_same_thread=False for FastAPI)."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    """Get a database connection — PostgreSQL if DATABASE_URL is set, otherwise SQLite."""
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        return conn
+    else:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+
+def get_cursor(conn):
+    """Get a cursor appropriate for the database type — returns dict-like rows."""
+    if USE_POSTGRES:
+        return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    else:
+        return conn.cursor()
+
+
+def close_db(conn):
+    """Safely close a database connection."""
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def execute_sql(conn, sql, params=None):
+    """Execute a single SQL statement with optional params. Returns cursor."""
+    cur = get_cursor(conn)
+    if params is not None:
+        cur.execute(sql, params)
+    else:
+        cur.execute(sql)
+    return cur
 
 
 def init_db():
     """Initialize database tables if they don't exist."""
     conn = get_db()
     try:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS raw_data (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                filename TEXT NOT NULL,
-                uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
-                row_count INTEGER NOT NULL,
-                csv_content BLOB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS sku_profiles (
-                sku_code TEXT PRIMARY KEY,
-                latest_br REAL NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
-            CREATE TABLE IF NOT EXISTS sku_uoms (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                sku_code TEXT NOT NULL,
-                uom TEXT NOT NULL,
-                cf INTEGER NOT NULL,
-                FOREIGN KEY (sku_code) REFERENCES sku_profiles(sku_code)
-            );
-            CREATE TABLE IF NOT EXISTS outliers_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                generated_at TEXT NOT NULL DEFAULT (datetime('now')),
-                excel_data BLOB NOT NULL,
-                row_count INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_sku_uoms_sku ON sku_uoms(sku_code);
-        """)
+        if USE_POSTGRES:
+            statements = [
+                """CREATE TABLE IF NOT EXISTS raw_data (
+                    id SERIAL PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    uploaded_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    row_count INTEGER NOT NULL,
+                    csv_content BYTEA NOT NULL
+                );""",
+                """CREATE TABLE IF NOT EXISTS sku_profiles (
+                    sku_code TEXT PRIMARY KEY,
+                    latest_br REAL NOT NULL,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );""",
+                """CREATE TABLE IF NOT EXISTS sku_uoms (
+                    id SERIAL PRIMARY KEY,
+                    sku_code TEXT NOT NULL,
+                    uom TEXT NOT NULL,
+                    cf INTEGER NOT NULL,
+                    FOREIGN KEY (sku_code) REFERENCES sku_profiles(sku_code)
+                );""",
+                """CREATE TABLE IF NOT EXISTS outliers_cache (
+                    id SERIAL PRIMARY KEY,
+                    generated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                    excel_data BYTEA NOT NULL,
+                    row_count INTEGER NOT NULL
+                );""",
+                """CREATE INDEX IF NOT EXISTS idx_sku_uoms_sku ON sku_uoms(sku_code);"""
+            ]
+        else:
+            statements = [
+                """CREATE TABLE IF NOT EXISTS raw_data (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename TEXT NOT NULL,
+                    uploaded_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    row_count INTEGER NOT NULL,
+                    csv_content BLOB NOT NULL
+                );""",
+                """CREATE TABLE IF NOT EXISTS sku_profiles (
+                    sku_code TEXT PRIMARY KEY,
+                    latest_br REAL NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );""",
+                """CREATE TABLE IF NOT EXISTS sku_uoms (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sku_code TEXT NOT NULL,
+                    uom TEXT NOT NULL,
+                    cf INTEGER NOT NULL,
+                    FOREIGN KEY (sku_code) REFERENCES sku_profiles(sku_code)
+                );""",
+                """CREATE TABLE IF NOT EXISTS outliers_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    excel_data BLOB NOT NULL,
+                    row_count INTEGER NOT NULL
+                );""",
+                """CREATE INDEX IF NOT EXISTS idx_sku_uoms_sku ON sku_uoms(sku_code);"""
+            ]
+        for stmt in statements:
+            cur = get_cursor(conn)
+            cur.execute(stmt)
+            cur.close()
         conn.commit()
     finally:
-        conn.close()
+        close_db(conn)
 
 
 def save_raw_data_to_db(csv_bytes: bytes, filename: str, row_count: int):
     """Replace raw_data table with new CSV content."""
     conn = get_db()
     try:
-        conn.execute("DELETE FROM raw_data")
-        conn.execute(
-            "INSERT INTO raw_data (filename, row_count, csv_content) VALUES (?, ?, ?)",
-            (filename, row_count, csv_bytes)
-        )
+        execute_sql(conn, "DELETE FROM raw_data").close()
+        if USE_POSTGRES:
+            execute_sql(conn,
+                "INSERT INTO raw_data (filename, row_count, csv_content) VALUES (%s, %s, %s)",
+                (filename, row_count, csv_bytes)
+            ).close()
+        else:
+            execute_sql(conn,
+                "INSERT INTO raw_data (filename, row_count, csv_content) VALUES (?, ?, ?)",
+                (filename, row_count, csv_bytes)
+            ).close()
         conn.commit()
     finally:
-        conn.close()
+        close_db(conn)
 
 
 def load_raw_csv_from_db():
     """Load the stored CSV content from DB and return as BytesIO, or None if empty."""
     conn = get_db()
     try:
-        row = conn.execute("SELECT csv_content, row_count FROM raw_data ORDER BY id DESC LIMIT 1").fetchone()
+        cur = execute_sql(conn, "SELECT csv_content, row_count FROM raw_data ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        cur.close()
         if row is None:
             return None, 0, None
-        csv_bytes = row['csv_content']
+        raw_bytes = row['csv_content']
         row_count = row['row_count']
+        # PostgreSQL returns BYTEA as memoryview; SQLite returns bytes directly
+        if hasattr(raw_bytes, 'tobytes'):
+            csv_bytes = raw_bytes.tobytes()
+        elif isinstance(raw_bytes, memoryview):
+            csv_bytes = bytes(raw_bytes)
+        else:
+            csv_bytes = raw_bytes
         return io.BytesIO(csv_bytes), row_count, io.StringIO(csv_bytes.decode('utf-8'))
     finally:
-        conn.close()
+        close_db(conn)
 
 
 def save_profiles_to_db(profiles: dict):
     """Save SKU profiles to database (replace all existing)."""
     conn = get_db()
     try:
-        conn.execute("DELETE FROM sku_profiles")
-        conn.execute("DELETE FROM sku_uoms")
+        execute_sql(conn, "DELETE FROM sku_profiles").close()
+        execute_sql(conn, "DELETE FROM sku_uoms").close()
         for sku, profile in profiles.items():
-            conn.execute(
-                "INSERT INTO sku_profiles (sku_code, latest_br) VALUES (?, ?)",
-                (sku, profile['latest_br'])
-            )
+            if USE_POSTGRES:
+                execute_sql(conn,
+                    "INSERT INTO sku_profiles (sku_code, latest_br) VALUES (%s, %s)",
+                    (sku, profile['latest_br'])
+                ).close()
+            else:
+                execute_sql(conn,
+                    "INSERT INTO sku_profiles (sku_code, latest_br) VALUES (?, ?)",
+                    (sku, profile['latest_br'])
+                ).close()
             for uom, cf in profile['valid_uoms'].items():
-                conn.execute(
-                    "INSERT INTO sku_uoms (sku_code, uom, cf) VALUES (?, ?, ?)",
-                    (sku, uom, cf)
-                )
+                if USE_POSTGRES:
+                    execute_sql(conn,
+                        "INSERT INTO sku_uoms (sku_code, uom, cf) VALUES (%s, %s, %s)",
+                        (sku, uom, cf)
+                    ).close()
+                else:
+                    execute_sql(conn,
+                        "INSERT INTO sku_uoms (sku_code, uom, cf) VALUES (?, ?, ?)",
+                        (sku, uom, cf)
+                    ).close()
         conn.commit()
     finally:
-        conn.close()
+        close_db(conn)
 
 
 def load_profiles_from_db() -> dict:
@@ -153,12 +260,17 @@ def load_profiles_from_db() -> dict:
     conn = get_db()
     try:
         profiles = {}
-        sku_rows = conn.execute("SELECT sku_code, latest_br FROM sku_profiles").fetchall()
+        cur = execute_sql(conn, "SELECT sku_code, latest_br FROM sku_profiles")
+        sku_rows = cur.fetchall()
+        cur.close()
         for sku_row in sku_rows:
             sku = sku_row['sku_code']
-            uom_rows = conn.execute(
-                "SELECT uom, cf FROM sku_uoms WHERE sku_code = ?", (sku,)
-            ).fetchall()
+            uom_cur = execute_sql(conn,
+                "SELECT uom, cf FROM sku_uoms WHERE sku_code = %s" if USE_POSTGRES else "SELECT uom, cf FROM sku_uoms WHERE sku_code = ?",
+                (sku,)
+            )
+            uom_rows = uom_cur.fetchall()
+            uom_cur.close()
             valid_uoms = {row['uom']: row['cf'] for row in uom_rows}
             profiles[sku] = {
                 'latest_br': sku_row['latest_br'],
@@ -166,35 +278,48 @@ def load_profiles_from_db() -> dict:
             }
         return profiles
     finally:
-        conn.close()
+        close_db(conn)
 
 
 def save_outliers_cache(excel_bytes: bytes, row_count: int):
     """Replace outliers cache with newly computed Excel data."""
     conn = get_db()
     try:
-        conn.execute("DELETE FROM outliers_cache")
-        conn.execute(
-            "INSERT INTO outliers_cache (excel_data, row_count) VALUES (?, ?)",
-            (excel_bytes, row_count)
-        )
+        execute_sql(conn, "DELETE FROM outliers_cache").close()
+        if USE_POSTGRES:
+            execute_sql(conn,
+                "INSERT INTO outliers_cache (excel_data, row_count) VALUES (%s, %s)",
+                (excel_bytes, row_count)
+            ).close()
+        else:
+            execute_sql(conn,
+                "INSERT INTO outliers_cache (excel_data, row_count) VALUES (?, ?)",
+                (excel_bytes, row_count)
+            ).close()
         conn.commit()
     finally:
-        conn.close()
+        close_db(conn)
 
 
 def load_outliers_cache() -> tuple:
     """Load cached Excel data. Returns (excel_bytes, row_count) or (None, 0)."""
     conn = get_db()
     try:
-        row = conn.execute(
-            "SELECT excel_data, row_count FROM outliers_cache ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        cur = execute_sql(conn, "SELECT excel_data, row_count FROM outliers_cache ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        cur.close()
         if row is None:
             return None, 0
-        return row['excel_data'], row['row_count']
+        raw_bytes = row['excel_data']
+        if hasattr(raw_bytes, 'tobytes'):
+            excel_bytes = raw_bytes.tobytes()
+        elif isinstance(raw_bytes, memoryview):
+            excel_bytes = bytes(raw_bytes)
+        else:
+            excel_bytes = raw_bytes
+        return excel_bytes, row['row_count']
     finally:
-        conn.close()
+        close_db(conn)
 
 
 def add_startup_log(message, processed=None, total=None):
@@ -581,6 +706,12 @@ def startup_event():
     startup_data_loaded = False
     startup_processed_rows = 0
     startup_total_rows = 0
+
+    # Log which database is being used
+    if USE_POSTGRES:
+        add_startup_log("✓ Using PostgreSQL database (persistent storage across restarts).")
+    else:
+        add_startup_log("ℹ Using SQLite database (local development mode). Set DATABASE_URL for PostgreSQL.")
 
     # Initialize database
     init_db()
