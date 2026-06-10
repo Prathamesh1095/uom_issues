@@ -212,7 +212,8 @@ function UploadProgress({ progress, onDismiss }) {
             <span className="font-medium">
               {progress.status === 'success' ? 'Processing complete' :
                progress.status === 'error' ? 'Processing failed' :
-               'Processing file...'}
+               progress.file_type === 'sales' ? 'Processing Sales Data...' :
+               'Processing GRN Data...'}
             </span>
             <span className={clsx(
               "font-semibold",
@@ -306,9 +307,17 @@ function App() {
   const [dataLoaded, setDataLoaded] = useState(false);
   const [salesSummary, setSalesSummary] = useState(null);
   const [isFetchingSummary, setIsFetchingSummary] = useState(false);
+  
+  // Export report progress tracking (0-100, -1 = not started, -2 = checking)
+  const [grnOutliersProgress, setGrnOutliersProgress] = useState(-2);
+  const [salesOutliersProgress, setSalesOutliersProgress] = useState(-2);
+  const [salesLossProgress, setSalesLossProgress] = useState(-2);
+  const [grnTemplateAvailable, setGrnTemplateAvailable] = useState(false);
+  const [salesTemplateAvailable, setSalesTemplateAvailable] = useState(true);
 
   const debounceTimeout = useRef(null);
   const pollTimeout = useRef(null);
+  const exportProgressTimeout = useRef(null);
 
   // Check server status on mount
   useEffect(() => {
@@ -329,6 +338,29 @@ function App() {
       }
     };
     checkServer();
+  }, []);
+
+  // Poll export progress periodically
+  useEffect(() => {
+    const pollExportProgress = async () => {
+      try {
+        const res = await axios.get(`${API_URL}/export_progress`);
+        const data = res.data;
+        setGrnOutliersProgress(data.grn_outliers);
+        setSalesOutliersProgress(data.sales_outliers);
+        setSalesLossProgress(data.sales_loss);
+        setGrnTemplateAvailable(data.grn_template_available);
+        setSalesTemplateAvailable(data.sales_template_available);
+      } catch {
+        // Silently fail
+      }
+    };
+
+    // Poll on mount and during relevant periods
+    pollExportProgress();
+    const interval = setInterval(pollExportProgress, 5000); // every 5s
+
+    return () => clearInterval(interval);
   }, []);
 
   const fetchSalesSummary = async () => {
@@ -431,17 +463,22 @@ function App() {
 
   const handleDownloadTemplate = async () => {
     try {
-      const response = await axios.get(`${API_URL}/download_template`, {
+      // Download the appropriate template based on selected file type
+      const url = fileType === 'sales' ? `${API_URL}/download_sales_template` : `${API_URL}/download_template`;
+      const filename = fileType === 'sales' ? 'sales_template.csv' : 'grn_template.csv';
+      
+      const response = await axios.get(url, {
         responseType: 'blob',
       });
-      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const blob = new Blob([response.data]);
+      const downloadUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
-      link.href = url;
-      link.setAttribute('download', 'grn_template.csv');
+      link.href = downloadUrl;
+      link.setAttribute('download', filename);
       document.body.appendChild(link);
       link.click();
       link.remove();
-      window.URL.revokeObjectURL(url);
+      window.URL.revokeObjectURL(downloadUrl);
     } catch (error) {
       console.error("Error downloading template:", error);
       alert("Failed to download template.");
@@ -449,6 +486,8 @@ function App() {
   };
 
   const handleExportOutliers = async () => {
+    if (grnOutliersProgress !== -1 && grnOutliersProgress < 100) return; // still computing
+    if (grnOutliersProgress === -1) return; // not available
     setIsExporting(true);
     try {
       const response = await axios.get(`${API_URL}/export_outliers`, {
@@ -471,6 +510,8 @@ function App() {
   };
 
   const handleExportSalesOutliers = async () => {
+    if (salesOutliersProgress !== -1 && salesOutliersProgress < 100) return; // still computing
+    if (salesOutliersProgress === -1) return; // not available
     setIsExportingSales(true);
     try {
       const response = await axios.get(`${API_URL}/export_sales_outliers`, {
@@ -493,6 +534,8 @@ function App() {
   };
 
   const handleExportSalesLossSummary = async () => {
+    if (salesLossProgress !== -1 && salesLossProgress < 100) return;
+    if (salesLossProgress === -1) return;
     setIsExportingLoss(true);
     try {
       const response = await axios.get(`${API_URL}/export_sales_loss_summary`, {
@@ -572,6 +615,22 @@ function App() {
     return '₹' + Number(value).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   };
 
+  // Compute if export buttons should show progress or be clickable
+  const isGrnOutliersComputing = grnOutliersProgress >= 0 && grnOutliersProgress < 100;
+  const isGrnOutliersReady = grnOutliersProgress === 100;
+  const isGrnOutliersUnavailable = grnOutliersProgress === -1;
+  
+  const isSalesOutliersComputing = salesOutliersProgress >= 0 && salesOutliersProgress < 100;
+  const isSalesOutliersReady = salesOutliersProgress === 100;
+  
+  const isSalesLossComputing = salesLossProgress >= 0 && salesLossProgress < 100;
+  const isSalesLossReady = salesLossProgress === 100;
+
+  const isTemplateDisabled = fileType === 'grn' ? !grnTemplateAvailable : !salesTemplateAvailable;
+
+  // Check if we're still initializing export progress
+  const isCheckingExports = grnOutliersProgress === -2;
+
   return (
     <div className="min-h-screen bg-gray-50 flex items-start justify-center p-4 pt-8">
       <StartupOverlay show={showStartupOverlay} dataLoaded={dataLoaded} onClose={() => setShowStartupOverlay(false)} />
@@ -593,46 +652,89 @@ function App() {
           <div className="flex flex-wrap gap-2">
             <button 
               onClick={handleDownloadTemplate}
-              className="flex items-center space-x-1.5 bg-slate-700 hover:bg-slate-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+              disabled={isTemplateDisabled}
+              className="flex items-center space-x-1.5 bg-slate-700 hover:bg-slate-600 disabled:bg-slate-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
             >
               <FileDown className="w-3.5 h-3.5" />
-              <span>Template</span>
+              <span>{fileType === 'sales' ? 'Sales Template' : 'GRN Template'}</span>
             </button>
             <button 
               onClick={handleExportOutliers}
-              disabled={isExporting}
-              className="flex items-center space-x-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+              disabled={isExporting || isGrnOutliersComputing || isGrnOutliersUnavailable || isCheckingExports}
+              className={clsx(
+                "flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors",
+                isGrnOutliersComputing 
+                  ? "bg-indigo-400 text-white cursor-not-allowed"
+                  : isGrnOutliersReady
+                    ? "bg-indigo-600 hover:bg-indigo-700 text-white"
+                    : "bg-indigo-400 text-white cursor-not-allowed"
+              )}
             >
               {isExporting ? (
                 <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+              ) : isGrnOutliersComputing ? (
+                <div className="flex items-center">
+                  <Download className="w-3.5 h-3.5 mr-1" />
+                  <span>GRN Outliers {grnOutliersProgress}%</span>
+                </div>
               ) : (
-                <Download className="w-3.5 h-3.5" />
+                <>
+                  <Download className="w-3.5 h-3.5" />
+                  <span>GRN Outliers</span>
+                </>
               )}
-              <span>GRN Outliers</span>
             </button>
             <button 
               onClick={handleExportSalesOutliers}
-              disabled={isExportingSales}
-              className="flex items-center space-x-1.5 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+              disabled={isExportingSales || isSalesOutliersComputing || isSalesOutliersReady === false || isCheckingExports}
+              className={clsx(
+                "flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors",
+                isSalesOutliersComputing 
+                  ? "bg-emerald-400 text-white cursor-not-allowed"
+                  : isSalesOutliersReady
+                    ? "bg-emerald-600 hover:bg-emerald-700 text-white"
+                    : "bg-emerald-400 text-white cursor-not-allowed"
+              )}
             >
               {isExportingSales ? (
                 <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+              ) : isSalesOutliersComputing ? (
+                <div className="flex items-center">
+                  <Download className="w-3.5 h-3.5 mr-1" />
+                  <span>Sales Outliers {salesOutliersProgress}%</span>
+                </div>
               ) : (
-                <Download className="w-3.5 h-3.5" />
+                <>
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Sales Outliers</span>
+                </>
               )}
-              <span>Sales Outliers</span>
             </button>
             <button 
               onClick={handleExportSalesLossSummary}
-              disabled={isExportingLoss}
-              className="flex items-center space-x-1.5 bg-amber-600 hover:bg-amber-700 disabled:bg-amber-400 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+              disabled={isExportingLoss || isSalesLossComputing || isSalesLossReady === false || isCheckingExports}
+              className={clsx(
+                "flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors",
+                isSalesLossComputing 
+                  ? "bg-amber-400 text-white cursor-not-allowed"
+                  : isSalesLossReady
+                    ? "bg-amber-600 hover:bg-amber-700 text-white"
+                    : "bg-amber-400 text-white cursor-not-allowed"
+              )}
             >
               {isExportingLoss ? (
                 <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+              ) : isSalesLossComputing ? (
+                <div className="flex items-center">
+                  <Download className="w-3.5 h-3.5 mr-1" />
+                  <span>Loss Summary {salesLossProgress}%</span>
+                </div>
               ) : (
-                <Download className="w-3.5 h-3.5" />
+                <>
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Loss Summary</span>
+                </>
               )}
-              <span>Loss Summary</span>
             </button>
           </div>
         </div>

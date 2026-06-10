@@ -64,6 +64,13 @@ startup_data_loaded = False
 startup_total_rows = 0
 startup_processed_rows = 0
 
+# Export report readiness tracking (0-100, -1 = not started)
+grn_outliers_progress = -1
+sales_outliers_progress = -1
+sales_loss_progress = -1
+grn_template_available = False
+sales_template_available = True  # sales template is always available (static columns)
+
 
 class PredictRequest(BaseModel):
     sku_code: str
@@ -667,24 +674,36 @@ def compute_sales_outliers(sales_csv_source) -> tuple:
 
 def precompute_and_cache_sales_outliers(csv_source):
     """Compute sales outliers from CSV, cache both reports as Excel in DB. Returns (row_count, loss_row_count, bytes)."""
+    global sales_outliers_progress, sales_loss_progress
+    sales_outliers_progress = 0
+    sales_loss_progress = 0
     try:
         outliers_df, loss_summary_df = compute_sales_outliers(csv_source)
+        sales_outliers_progress = 30
+        sales_loss_progress = 30
 
         # Cache outliers Excel
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
             outliers_df.to_excel(writer, index=False, sheet_name='Sales Outliers')
         save_sales_outliers_cache(excel_buffer.getvalue(), len(outliers_df))
+        sales_outliers_progress = 60
 
         # Cache loss summary Excel
         excel_buffer2 = io.BytesIO()
         with pd.ExcelWriter(excel_buffer2, engine='openpyxl') as writer:
             loss_summary_df.to_excel(writer, index=False, sheet_name='Sales Loss Summary')
         save_sales_loss_summary_cache(excel_buffer2.getvalue(), len(loss_summary_df))
+        sales_loss_progress = 60
+
+        sales_outliers_progress = 100
+        sales_loss_progress = 100
 
         return len(outliers_df), len(loss_summary_df)
     except Exception as e:
         add_startup_log(f"⚠ Sales outliers precomputation failed: {str(e)}")
+        sales_outliers_progress = -1
+        sales_loss_progress = -1
         return 0, 0
 
 
@@ -948,25 +967,31 @@ def compute_outliers_from_csv(csv_source) -> pd.DataFrame:
 
 def precompute_and_cache_outliers(csv_source):
     """Compute outliers from CSV data and cache as Excel in DB. Returns (row_count, file_size_bytes)."""
-    global startup_logs
+    global startup_logs, grn_outliers_progress
     add_startup_log("Precomputing outliers report...")
+    grn_outliers_progress = 0
 
     try:
+        grn_outliers_progress = 10
         outliers_df = compute_outliers_from_csv(csv_source)
+        grn_outliers_progress = 70
 
         # Write to Excel in memory
         excel_buffer = io.BytesIO()
         with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
             outliers_df.to_excel(writer, index=False, sheet_name='Outliers')
         excel_bytes = excel_buffer.getvalue()
+        grn_outliers_progress = 90
 
         row_count = len(outliers_df)
         save_outliers_cache(excel_bytes, row_count)
 
         add_startup_log(f"✓ Outliers precomputed: {row_count:,} rows ({len(excel_bytes):,} bytes)")
+        grn_outliers_progress = 100
         return row_count, len(excel_bytes)
     except Exception as e:
         add_startup_log(f"⚠ Outliers precomputation failed: {str(e)}")
+        grn_outliers_progress = -1
         return 0, 0
 
 
@@ -1070,6 +1095,8 @@ async def load_startup_data_async():
         sku_profiles = await asyncio.to_thread(process)
         startup_data_loaded = True
         add_startup_log(f"✓ Startup complete. Loaded profiles for {len(sku_profiles)} SKUs.")
+
+        grn_template_available = True
 
         # Save profiles to DB
         save_profiles_to_db(sku_profiles)
@@ -1470,6 +1497,37 @@ def download_template():
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=grn_template.csv"}
     )
+
+
+@app.get("/download_sales_template")
+def download_sales_template():
+    """Download an empty CSV template for sales data."""
+    sales_columns = ['Date', 'Order ID', 'SKU Code', 'Sales Price', 'Sales UOM', 'Sales Qty']
+    template_df = pd.DataFrame(columns=sales_columns)
+    
+    csv_buffer = io.StringIO()
+    template_df.to_csv(csv_buffer, index=False)
+    
+    return Response(
+        content=csv_buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=sales_template.csv"}
+    )
+
+
+@app.get("/export_progress")
+def get_export_progress():
+    """Return the computation progress of all export reports."""
+    global grn_outliers_progress, sales_outliers_progress, sales_loss_progress
+    global grn_template_available, sales_template_available
+    
+    return {
+        "grn_outliers": grn_outliers_progress,
+        "sales_outliers": sales_outliers_progress,
+        "sales_loss": sales_loss_progress,
+        "grn_template_available": grn_template_available,
+        "sales_template_available": sales_template_available
+    }
 
 
 # ─── Sales API Endpoints ────────────────────────────────────────────────────────
