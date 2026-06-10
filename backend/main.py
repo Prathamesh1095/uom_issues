@@ -596,27 +596,28 @@ def compute_sales_outliers(sales_csv_source) -> tuple:
                     f"Price {sales_price:.2f} is outside expected range [{lower_bound:.2f}, {upper_bound:.2f}] "
                     f"for UOM='{sales_uom}' (CF={cf})."
                 )
+                correct_expected_price = expected_price
+                suggested_uom = best_match['uom']
+                suggested_cf = best_match['cf']
         else:
             is_outlier = True
             reason_parts.append(
                 f"UOM '{sales_uom}' not found in GRN valid UOMs for SKU '{sku}'. "
                 f"Valid UOMs: {', '.join(valid_uoms.keys())}"
             )
+            correct_expected_price = best_match['expected_price']
+            suggested_uom = best_match['uom']
+            suggested_cf = best_match['cf']
 
         if not is_outlier:
             continue
-
-        # Calculate expected price using closest matching UOM
-        correct_expected_price = best_match['expected_price']
-        suggested_uom = best_match['uom']
-        suggested_cf = best_match['cf']
 
         # Sales loss: only count when selling below the correct expected price
         price_diff = correct_expected_price - sales_price
         sales_loss = max(0, round(price_diff * sales_qty, 2))
 
         reason_parts.append(
-            f"Closest valid UOM is '{suggested_uom}' (CF={suggested_cf}, expected price={correct_expected_price:.2f})."
+            f"Closest valid UOM is '{suggested_uom}' (CF={suggested_cf}, expected price={best_match['expected_price']:.2f})."
         )
         reason = " | ".join(reason_parts)
 
