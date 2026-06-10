@@ -226,8 +226,8 @@ def save_profiles_to_db(profiles: dict):
     """Save SKU profiles to database (replace all existing)."""
     conn = get_db()
     try:
-        execute_sql(conn, "DELETE FROM sku_profiles").close()
         execute_sql(conn, "DELETE FROM sku_uoms").close()
+        execute_sql(conn, "DELETE FROM sku_profiles").close()
         for sku, profile in profiles.items():
             if USE_POSTGRES:
                 execute_sql(conn,
