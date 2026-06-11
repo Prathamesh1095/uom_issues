@@ -493,6 +493,31 @@ def load_sales_loss_summary_cache() -> tuple:
         close_db(conn)
 
 
+# ─── UOM Name Extraction ────────────────────────────────────────────────────────
+
+
+def extract_uom_name(uom_str: str) -> str:
+    """Extract the base UOM name from a UOM string.
+
+    Examples:
+        '1 Piece' -> 'Piece'
+        '1 Pack' -> 'Pack'
+        '1 Pack of 100 Piece' -> 'Pack'
+        'Pack of 100 Piece' -> 'Pack'
+        'Pack 1' -> 'Pack'
+        'Box of 5' -> 'Box'
+        'Each' -> 'Each'
+    """
+    filler = {"of", "and", "per", "the", "a", "an"}
+    for word in uom_str.split():
+        clean = word.strip()
+        if clean.isdigit() or clean.lower() in filler:
+            continue
+        if clean.isalpha():
+            return clean
+    return uom_str
+
+
 # ─── Sales Outlier Detection Logic ──────────────────────────────────────────────
 
 
@@ -531,6 +556,7 @@ def compute_sales_outliers(sales_csv_source) -> tuple:
         processed += 1
         sku = str(row.get('SKU Code', '')).strip()
         sales_uom = str(row.get('Sales UOM', '')).strip()
+        extracted_uom = extract_uom_name(sales_uom)
         sales_price = row.get('Sales Price', 0)
         sales_qty = int(row.get('Sales Qty', 0))
         sales_date = row.get('Date', '')
@@ -583,18 +609,28 @@ def compute_sales_outliers(sales_csv_source) -> tuple:
         is_outlier = False
         reason_parts = []
 
-        # Check if Sales UOM is in valid UOMs
+        # Try exact match first, then partial match via extracted UOM name
+        matched_uom = None
         if sales_uom in valid_uoms:
-            cf = valid_uoms[sales_uom]
+            matched_uom = sales_uom
+        else:
+            for uom_key in valid_uoms:
+                if extracted_uom.lower() in uom_key.lower():
+                    matched_uom = uom_key
+                    break
+
+        if matched_uom:
+            cf = valid_uoms[matched_uom]
             expected_price = latest_br * cf
             lower_bound = expected_price * lower_mult
             upper_bound = expected_price * upper_mult
 
             if sales_price < lower_bound or sales_price > upper_bound:
                 is_outlier = True
+                match_info = f"UOM='{sales_uom}' (matched to '{matched_uom}', CF={cf})"
                 reason_parts.append(
                     f"Price {sales_price:.2f} is outside expected range [{lower_bound:.2f}, {upper_bound:.2f}] "
-                    f"for UOM='{sales_uom}' (CF={cf})."
+                    f"for {match_info}."
                 )
                 correct_expected_price = expected_price
                 suggested_uom = best_match['uom']
@@ -602,7 +638,7 @@ def compute_sales_outliers(sales_csv_source) -> tuple:
         else:
             is_outlier = True
             reason_parts.append(
-                f"UOM '{sales_uom}' not found in GRN valid UOMs for SKU '{sku}'. "
+                f"UOM '{sales_uom}' (extracted: '{extracted_uom}') not found in GRN valid UOMs for SKU '{sku}'. "
                 f"Valid UOMs: {', '.join(valid_uoms.keys())}"
             )
             correct_expected_price = best_match['expected_price']
