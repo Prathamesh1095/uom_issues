@@ -299,7 +299,7 @@ function App() {
   const [isExportingLoss, setIsExportingLoss] = useState(false);
   
   const [selectedFile, setSelectedFile] = useState(null);
-  const [fileType, setFileType] = useState('grn'); // 'grn' or 'sales'
+  const [fileType, setFileType] = useState('grn'); // 'grn', 'sales', or 'uom_master'
   const [isUploading, setIsUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState({ type: '', text: '' });
   const [uploadProgress, setUploadProgress] = useState(null);
@@ -307,6 +307,8 @@ function App() {
   const [dataLoaded, setDataLoaded] = useState(false);
   const [salesSummary, setSalesSummary] = useState(null);
   const [isFetchingSummary, setIsFetchingSummary] = useState(false);
+  const [uomMasterStatus, setUomMasterStatus] = useState(null);
+  const [isCheckingUomMaster, setIsCheckingUomMaster] = useState(false);
   
   // Export report progress tracking (0-100, -1 = not started, -2 = checking)
   const [grnOutliersProgress, setGrnOutliersProgress] = useState(-2);
@@ -336,9 +338,23 @@ function App() {
       } catch {
         setShowStartupOverlay(true);
       }
+      // Check UOM master status
+      fetchUomMasterStatus();
     };
     checkServer();
   }, []);
+
+  const fetchUomMasterStatus = async () => {
+    try {
+      setIsCheckingUomMaster(true);
+      const res = await axios.get(`${API_URL}/uom_master_status`);
+      setUomMasterStatus(res.data);
+    } catch {
+      // Silently fail
+    } finally {
+      setIsCheckingUomMaster(false);
+    }
+  };
 
   // Poll export progress periodically
   useEffect(() => {
@@ -434,25 +450,40 @@ function App() {
     
     const formData = new FormData();
     formData.append('file', selectedFile);
-    formData.append('file_type', fileType);
     
     try {
-      const response = await axios.post(`${API_URL}/upload_data`, formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data',
-        },
-      });
+      let response;
       
-      if (response.data.status === 'success') {
-        setUploadMsg({ type: 'success', text: response.data.message });
+      if (fileType === 'uom_master') {
+        // UOM master upload is synchronous
+        response = await axios.post(`${API_URL}/upload_uom_master`, formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+        });
+        
+        if (response.data.status === 'success') {
+          setUploadMsg({ type: 'success', text: response.data.message });
+          fetchUomMasterStatus();
+        } else {
+          setUploadMsg({ type: 'error', text: response.data.message });
+        }
         setIsUploading(false);
-        if (fileType === 'sales') fetchSalesSummary();
-      } else if (response.data.status === 'accepted') {
-        setUploadMsg({ type: 'info', text: response.data.message });
-        pollUploadStatus(response.data.task_id);
       } else {
-        setUploadMsg({ type: 'error', text: response.data.message });
-        setIsUploading(false);
+        formData.append('file_type', fileType);
+        response = await axios.post(`${API_URL}/upload_data`, formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+        });
+        
+        if (response.data.status === 'success') {
+          setUploadMsg({ type: 'success', text: response.data.message });
+          setIsUploading(false);
+          if (fileType === 'sales') fetchSalesSummary();
+        } else if (response.data.status === 'accepted') {
+          setUploadMsg({ type: 'info', text: response.data.message });
+          pollUploadStatus(response.data.task_id);
+        } else {
+          setUploadMsg({ type: 'error', text: response.data.message });
+          setIsUploading(false);
+        }
       }
     } catch (error) {
       console.error("Error uploading file:", error);
@@ -463,9 +494,17 @@ function App() {
 
   const handleDownloadTemplate = async () => {
     try {
-      // Download the appropriate template based on selected file type
-      const url = fileType === 'sales' ? `${API_URL}/download_sales_template` : `${API_URL}/download_template`;
-      const filename = fileType === 'sales' ? 'sales_template.csv' : 'grn_template.csv';
+      let url, filename;
+      if (fileType === 'sales') {
+        url = `${API_URL}/download_sales_template`;
+        filename = 'sales_template.csv';
+      } else if (fileType === 'uom_master') {
+        url = `${API_URL}/download_uom_master_template`;
+        filename = 'uom_master_template.csv';
+      } else {
+        url = `${API_URL}/download_template`;
+        filename = 'grn_template.csv';
+      }
       
       const response = await axios.get(url, {
         responseType: 'blob',
@@ -628,7 +667,7 @@ function App() {
   const isSalesLossReady = salesLossProgress === 100;
   const isSalesLossUnavailable = salesLossProgress === -1;
 
-  const isTemplateDisabled = fileType === 'grn' ? !grnTemplateAvailable : !salesTemplateAvailable;
+  const isTemplateDisabled = fileType === 'grn' ? !grnTemplateAvailable : fileType === 'sales' ? !salesTemplateAvailable : false;
 
   // Check if we're still initializing export progress
   const isCheckingExports = grnOutliersProgress === -2;
@@ -658,7 +697,7 @@ function App() {
               className="flex items-center space-x-1.5 bg-slate-700 hover:bg-slate-600 disabled:bg-slate-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
             >
               <FileDown className="w-3.5 h-3.5" />
-              <span>{fileType === 'sales' ? 'Sales Template' : 'GRN Template'}</span>
+              <span>{fileType === 'sales' ? 'Sales Template' : fileType === 'uom_master' ? 'UOM Master Template' : 'GRN Template'}</span>
             </button>
             <button 
               onClick={handleExportOutliers}
@@ -769,6 +808,17 @@ function App() {
               >
                 Sales Data
               </button>
+              <button
+                onClick={() => setFileType('uom_master')}
+                className={clsx(
+                  "px-3 py-1.5 rounded-md text-xs font-medium transition-all",
+                  fileType === 'uom_master'
+                    ? "bg-white text-amber-700 shadow-sm"
+                    : "text-gray-500 hover:text-gray-700"
+                )}
+              >
+                UOM Master
+              </button>
             </div>
           </div>
 
@@ -778,7 +828,9 @@ function App() {
                 "flex-1 cursor-pointer border rounded-lg px-4 py-2 text-sm transition-colors flex items-center justify-center",
                 fileType === 'sales'
                   ? "bg-white border-emerald-300 hover:border-emerald-500 text-gray-600"
-                  : "bg-white border-gray-300 hover:border-indigo-500 text-gray-600"
+                  : fileType === 'uom_master'
+                    ? "bg-white border-amber-300 hover:border-amber-500 text-gray-600"
+                    : "bg-white border-gray-300 hover:border-indigo-500 text-gray-600"
               )}>
                 <FileUp className="w-4 h-4 mr-2 text-gray-400" />
                 <span className="truncate">{selectedFile ? selectedFile.name : "Select CSV File..."}</span>
@@ -796,7 +848,9 @@ function App() {
                   "text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center",
                   fileType === 'sales'
                     ? "bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400"
-                    : "bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400"
+                    : fileType === 'uom_master'
+                      ? "bg-amber-600 hover:bg-amber-700 disabled:bg-amber-400"
+                      : "bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-400"
                 )}
               >
                 {isUploading ? (
@@ -809,6 +863,23 @@ function App() {
             </div>
           </div>
           
+          {/* UOM Master Status */}
+          {fileType === 'uom_master' && uomMasterStatus && (
+            <div className={clsx(
+              "mt-3 p-3 rounded-lg text-sm flex items-center space-x-2",
+              uomMasterStatus.loaded
+                ? "bg-amber-50 text-amber-700 border border-amber-200"
+                : "bg-gray-50 text-gray-500 border border-gray-200"
+            )}>
+              <Package className="w-4 h-4" />
+              <span>
+                {uomMasterStatus.loaded
+                  ? `UOM Master loaded: ${uomMasterStatus.sku_count} SKUs`
+                  : 'No UOM master loaded. Upload a UOM master CSV to define UOM→CF mappings.'}
+              </span>
+            </div>
+          )}
+
           <UploadProgress progress={uploadProgress} onDismiss={handleDismissProgress} />
 
           {uploadMsg.text && !uploadProgress && (

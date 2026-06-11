@@ -52,6 +52,7 @@ USE_POSTGRES = bool(DATABASE_URL and HAS_PSYCOPG2)
 DB_PATH = os.path.join(os.path.dirname(__file__), 'data.db')
 
 sku_profiles = {}
+uom_master_lookup: dict[str, dict[str, int]] = {}  # {sku_code: {uom_name: cf, ...}}
 global_df = None
 
 # In-memory task status store for async uploads
@@ -166,6 +167,18 @@ def init_db():
                     excel_data BYTEA NOT NULL,
                     row_count INTEGER NOT NULL
                 );""",
+                """CREATE TABLE IF NOT EXISTS uom_master (
+                    id SERIAL PRIMARY KEY,
+                    old_sku_id TEXT NOT NULL,
+                    listing_title TEXT,
+                    business_category TEXT,
+                    uom TEXT NOT NULL,
+                    flag TEXT DEFAULT 'Enabled',
+                    cf INTEGER NOT NULL,
+                    uom_type TEXT,
+                    uploaded_at TIMESTAMP NOT NULL DEFAULT NOW()
+                );""",
+                """CREATE INDEX IF NOT EXISTS idx_uom_master_sku ON uom_master(old_sku_id);""",
             ]
         else:
             statements = [
@@ -214,6 +227,18 @@ def init_db():
                     excel_data BLOB NOT NULL,
                     row_count INTEGER NOT NULL
                 );""",
+                """CREATE TABLE IF NOT EXISTS uom_master (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    old_sku_id TEXT NOT NULL,
+                    listing_title TEXT,
+                    business_category TEXT,
+                    uom TEXT NOT NULL,
+                    flag TEXT DEFAULT 'Enabled',
+                    cf INTEGER NOT NULL,
+                    uom_type TEXT,
+                    uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );""",
+                """CREATE INDEX IF NOT EXISTS idx_uom_master_sku ON uom_master(old_sku_id);""",
             ]
         for stmt in statements:
             cur = get_cursor(conn)
@@ -324,6 +349,80 @@ def load_profiles_from_db() -> dict:
         return profiles
     finally:
         close_db(conn)
+
+
+def save_uom_master_to_db(df: pd.DataFrame):
+    """Replace uom_master table with new data and rebuild lookup."""
+    global uom_master_lookup
+    conn = get_db()
+    try:
+        execute_sql(conn, "DELETE FROM uom_master").close()
+        for _, row in df.iterrows():
+            sku = str(row.get('old_sku_id', '')).strip()
+            uom = str(row.get('UOM', '')).strip()
+            cf = int(row.get('cf', 1))
+            listing_title = row.get('listing_title', '')
+            business_category = row.get('business_category', '')
+            flag = row.get('Flag', 'Enabled')
+            uom_type = row.get('uom_type', '')
+            if USE_POSTGRES:
+                execute_sql(conn,
+                    "INSERT INTO uom_master (old_sku_id, listing_title, business_category, uom, flag, cf, uom_type) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (sku, listing_title, business_category, uom, flag, cf, uom_type)
+                ).close()
+            else:
+                execute_sql(conn,
+                    "INSERT INTO uom_master (old_sku_id, listing_title, business_category, uom, flag, cf, uom_type) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (sku, listing_title, business_category, uom, flag, cf, uom_type)
+                ).close()
+        conn.commit()
+        # Rebuild in-memory lookup
+        uom_master_lookup = build_uom_master_lookup_from_db()
+    finally:
+        close_db(conn)
+
+
+def load_uom_master_from_db() -> pd.DataFrame:
+    """Load all UOM master records from database."""
+    conn = get_db()
+    try:
+        cur = execute_sql(conn, "SELECT * FROM uom_master ORDER BY old_sku_id")
+        rows = cur.fetchall()
+        cur.close()
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame([dict(r) for r in rows])
+    finally:
+        close_db(conn)
+
+
+def build_uom_master_lookup_from_db() -> dict[str, dict[str, int]]:
+    """Build {sku_code: {uom_name: cf}} lookup from uom_master table.
+    For 'Enabled' rows only, takes the first cf per uom per sku."""
+    df = load_uom_master_from_db()
+    if df.empty:
+        return {}
+    lookup = {}
+    df_filtered = df[df['flag'].str.lower() == 'enabled'] if 'flag' in df.columns else df
+    for _, row in df_filtered.iterrows():
+        sku = str(row.get('old_sku_id', '')).strip()
+        uom = str(row.get('uom', '')).strip()
+        cf = int(row.get('cf', 1))
+        if not sku or not uom:
+            continue
+        if sku not in lookup:
+            lookup[sku] = {}
+        if uom not in lookup[sku]:
+            lookup[sku][uom] = cf
+    return lookup
+
+
+def update_sku_profiles_valid_uoms_from_master():
+    """Update valid_uoms in all sku_profiles from the current uom_master_lookup.
+    SKUs not found in UOM master get empty valid_uoms."""
+    global sku_profiles
+    for sku in sku_profiles:
+        sku_profiles[sku]['valid_uoms'] = uom_master_lookup.get(sku, {})
 
 
 def save_outliers_cache(excel_bytes: bytes, row_count: int):
@@ -524,9 +623,12 @@ def extract_uom_name(uom_str: str) -> str:
 def compute_sales_outliers(sales_csv_source) -> tuple:
     """
     Compute sales outliers and loss summary from Sales CSV data, using existing GRN SKU profiles.
+    Normalizes sales price to per-base-unit (using UOM master CF) before outlier detection.
 
     Returns (outliers_df, loss_summary_df) as pandas DataFrames.
     """
+    global uom_master_lookup
+
     # Read Sales CSV
     if isinstance(sales_csv_source, str):
         sales_df = pd.read_csv(sales_csv_source, low_memory=False)
@@ -578,6 +680,7 @@ def compute_sales_outliers(sales_csv_source) -> tuple:
                 'Sales UOM': sales_uom,
                 'Sales Qty': sales_qty,
                 'Actual Sales Price': sales_price,
+                'Normalized Price (per base UOM)': '',
                 'Expected Price (Correct UOM)': '',
                 'Suggested UOM': '',
                 'Suggested CF': '',
@@ -588,74 +691,92 @@ def compute_sales_outliers(sales_csv_source) -> tuple:
             })
             continue
 
-        valid_uoms = profile['valid_uoms']  # {uom: cf, ...}
+        valid_uoms = profile['valid_uoms']  # {uom: cf, ...} — from UOM master
         latest_br = profile['latest_br']
 
         # If no valid UOMs defined, skip
         if not valid_uoms:
             continue
 
-        # Find the best matching UOM for this sales price
-        candidates = []
-        for uom, cf in valid_uoms.items():
-            exp_price = latest_br * cf
-            ratio = sales_price / exp_price if exp_price > 0 else 0
-            score = abs(math.log(ratio)) if ratio > 0 else float('inf')
-            candidates.append({'uom': uom, 'cf': cf, 'expected_price': exp_price, 'score': score})
+        # --- Step 1: Look up CF (UOM master first, then GRN valid_uoms) ---
+        cf = uom_master_lookup.get(sku, {}).get(extracted_uom)
+        matched_uom_source = 'UOM Master'
 
-        candidates.sort(key=lambda x: x['score'])
-        best_match = candidates[0]
+        if cf is None:
+            # Fall back to GRN valid_uoms: try exact match first, then partial
+            if sales_uom in valid_uoms:
+                cf = valid_uoms[sales_uom]
+                matched_uom_source = 'GRN'
+            else:
+                for uom_key in valid_uoms:
+                    if extracted_uom.lower() in uom_key.lower():
+                        cf = valid_uoms[uom_key]
+                        matched_uom_source = 'GRN'
+                        break
 
+        # --- Step 2: If no CF found, flag as outlier ---
         is_outlier = False
         reason_parts = []
+        suggested_uom = ''
+        suggested_cf = ''
+        normalized_price = 0
+        correct_expected_price = 0
 
-        # Try exact match first, then partial match via extracted UOM name
-        matched_uom = None
-        if sales_uom in valid_uoms:
-            matched_uom = sales_uom
-        else:
-            for uom_key in valid_uoms:
-                if extracted_uom.lower() in uom_key.lower():
-                    matched_uom = uom_key
-                    break
-
-        if matched_uom:
-            cf = valid_uoms[matched_uom]
-            expected_price = latest_br * cf
-            lower_bound = expected_price * lower_mult
-            upper_bound = expected_price * upper_mult
-
-            if sales_price < lower_bound or sales_price > upper_bound:
-                is_outlier = True
-                match_info = f"UOM='{sales_uom}' (matched to '{matched_uom}', CF={cf})"
-                reason_parts.append(
-                    f"Price {sales_price:.2f} is outside expected range [{lower_bound:.2f}, {upper_bound:.2f}] "
-                    f"for {match_info}."
-                )
-                correct_expected_price = expected_price
-                suggested_uom = best_match['uom']
-                suggested_cf = best_match['cf']
-        else:
+        if cf is None:
             is_outlier = True
             reason_parts.append(
-                f"UOM '{sales_uom}' (extracted: '{extracted_uom}') not found in GRN valid UOMs for SKU '{sku}'. "
+                f"UOM '{sales_uom}' (extracted: '{extracted_uom}') not found in UOM master or GRN valid UOMs for SKU '{sku}'. "
                 f"Valid UOMs: {', '.join(valid_uoms.keys())}"
             )
-            correct_expected_price = best_match['expected_price']
-            suggested_uom = best_match['uom']
-            suggested_cf = best_match['cf']
+            # Find closest valid UOM for suggestion
+            candidates = []
+            for uom, cf_val in valid_uoms.items():
+                exp_price = latest_br * cf_val
+                ratio = sales_price / exp_price if exp_price > 0 else 0
+                score = abs(math.log(ratio)) if ratio > 0 else float('inf')
+                candidates.append({'uom': uom, 'cf': cf_val, 'expected_price': exp_price, 'score': score})
+            if candidates:
+                candidates.sort(key=lambda x: x['score'])
+                best = candidates[0]
+                correct_expected_price = best['expected_price']
+                suggested_uom = best['uom']
+                suggested_cf = best['cf']
+            else:
+                correct_expected_price = 0
+        else:
+            # --- Step 3: Normalize price ---
+            normalized_price = sales_price / cf
+            expected_price_for_uom = latest_br * cf
+
+            lower_bound = latest_br * lower_mult
+            upper_bound = latest_br * upper_mult
+
+            if normalized_price < lower_bound or normalized_price > upper_bound:
+                is_outlier = True
+                reason_parts.append(
+                    f"Normalized price {normalized_price:.2f} (from '{sales_uom}' / CF={cf}) is outside expected range "
+                    f"[{lower_bound:.2f}, {upper_bound:.2f}] for base rate {latest_br:.4f}."
+                )
+                correct_expected_price = expected_price_for_uom
+                suggested_uom = extracted_uom
+                suggested_cf = cf
+            else:
+                # Not an outlier, skip
+                continue
 
         if not is_outlier:
             continue
 
-        # Sales loss: only count when selling below the correct expected price
-        price_diff = correct_expected_price - sales_price
+        # --- Step 4: Sales loss calculation ---
+        # Loss = (base_rate - normalized_price) * qty * cf  (total loss at UOM level)
+        price_diff = correct_expected_price - sales_price if correct_expected_price else 0
         sales_loss = max(0, round(price_diff * sales_qty, 2))
 
-        reason_parts.append(
-            f"Closest valid UOM is '{suggested_uom}' (CF={suggested_cf}, expected price={best_match['expected_price']:.2f})."
-        )
-        reason = " | ".join(reason_parts)
+        if reason_parts:
+            reason_parts.append(
+                f"Closest valid UOM is '{suggested_uom}' (CF={suggested_cf}, expected price={correct_expected_price:.2f})."
+            )
+        reason = " | ".join(reason_parts) if reason_parts else "Unknown reason."
 
         outliers_list.append({
             'Date': sales_date,
@@ -664,7 +785,8 @@ def compute_sales_outliers(sales_csv_source) -> tuple:
             'Sales UOM': sales_uom,
             'Sales Qty': sales_qty,
             'Actual Sales Price': sales_price,
-            'Expected Price (Correct UOM)': round(correct_expected_price, 2),
+            'Normalized Price (per base UOM)': round(normalized_price, 4) if normalized_price else '',
+            'Expected Price (Correct UOM)': round(correct_expected_price, 2) if correct_expected_price else '',
             'Suggested UOM': suggested_uom,
             'Suggested CF': suggested_cf,
             'Price Difference per Unit': round(price_diff, 2),
@@ -777,6 +899,7 @@ def build_sku_profiles_from_chunks(chunks, log_callback=None, known_total_rows=N
     Uses transform/groupby instead of per-SKU loops for ~100x faster processing.
     Tracks latest date during accumulation instead of sorting at the end.
     """
+    global uom_master_lookup
     lower_mult = config.get("historical_data", {}).get("median_br_lower_multiplier", 0.2)
     upper_mult = config.get("historical_data", {}).get("median_br_upper_multiplier", 5.0)
     total_rows_processed = 0
@@ -784,7 +907,6 @@ def build_sku_profiles_from_chunks(chunks, log_callback=None, known_total_rows=N
     # Accumulators across chunks
     all_rates = {}          # sku -> list of valid rates
     all_dates = {}          # sku -> dict of {date_str: (rate, uom, cf)}
-    all_uoms = {}           # sku -> dict of {(uom, cf): count}
     total_chunks = 0
 
     for chunk_idx, chunk in enumerate(chunks):
@@ -854,17 +976,6 @@ def build_sku_profiles_from_chunks(chunks, log_callback=None, known_total_rows=N
                         cf_val = row.get('Effective_CF', 1)
                         all_dates[sku][str_date] = (rate_val, str(uom_val) if pd.notna(uom_val) else '', int(cf_val) if pd.notna(cf_val) else 1)
 
-            # Track valid UOMs with their CF counts
-            if 'alternate_uom' in valid_chunk.columns:
-                if sku not in all_uoms:
-                    all_uoms[sku] = {}
-                for _, row in group.iterrows():
-                    uom_val = row.get('alternate_uom', '')
-                    cf_val = row.get('Effective_CF', 1)
-                    if pd.notna(uom_val) and str(uom_val).strip():
-                        key = (str(uom_val).strip(), int(cf_val) if pd.notna(cf_val) else 1)
-                        all_uoms[sku][key] = all_uoms[sku].get(key, 0) + 1
-
         total_rows_processed += len(chunk)
 
         if log_callback:
@@ -894,15 +1005,9 @@ def build_sku_profiles_from_chunks(chunks, log_callback=None, known_total_rows=N
             rate_val, uom_val, cf_val = all_dates[sku][latest_date]
             latest_br = rate_val
 
-        # Build valid_uoms dict with most frequent CF per UOM
-        valid_uoms = {}
-        if sku in all_uoms:
-            # Sort by count desc per UOM, keep highest CF for each UOM
-            uom_groups = {}
-            for (uom, cf), count in all_uoms[sku].items():
-                if uom not in uom_groups or count > uom_groups[uom][1]:
-                    uom_groups[uom] = (cf, count)
-            valid_uoms = {uom: cf for uom, (cf, _) in uom_groups.items()}
+        # Use UOM master for valid_uoms (authoritative source)
+        # If not available in UOM master, valid_uoms stays empty
+        valid_uoms = uom_master_lookup.get(sku, {})
 
         final_profiles[sku] = {
             'latest_br': latest_br,
@@ -1047,12 +1152,17 @@ def precompute_and_cache_outliers(csv_source):
 # --- Background startup data loading ---
 async def load_startup_data_async():
     """Load data in background so server starts immediately. Checks DB first, then falls back to file."""
-    global sku_profiles, global_df, startup_complete, startup_logs
+    global sku_profiles, global_df, startup_complete, startup_logs, uom_master_lookup
     global startup_processed_rows, startup_total_rows, startup_data_loaded
     global grn_outliers_progress, grn_template_available
     global sales_outliers_progress, sales_loss_progress
 
     add_startup_log("Starting background data loading...")
+
+    # Load UOM master from DB
+    uom_master_lookup = build_uom_master_lookup_from_db()
+    if uom_master_lookup:
+        add_startup_log(f"✓ Loaded UOM master for {len(uom_master_lookup)} SKUs.")
 
     # Check if we have cached data in DB first
     db_profiles = load_profiles_from_db()
@@ -1540,6 +1650,48 @@ async def upload_data(file: UploadFile = File(...), file_type: str = Form("grn")
         return {"status": "error", "message": f"Failed to process file: {str(e)}"}
 
 
+@app.post("/upload_uom_master")
+async def upload_uom_master(file: UploadFile = File(...)):
+    """Upload UOM master CSV (old_sku_id, listing_title, business_category, UOM, Flag, cf, uom_type).
+    Replaces all existing UOM master data and rebuilds sku_profiles valid_uoms."""
+    global uom_master_lookup
+
+    if not file.filename.endswith('.csv'):
+        return {"status": "error", "message": "Only .csv files are accepted. Please upload a CSV file."}
+
+    try:
+        contents = await file.read()
+        row_count = contents.count(b'\n') - 1
+        if row_count <= 0:
+            return {"status": "error", "message": "File appears to be empty or has no data rows."}
+
+        df = pd.read_csv(io.BytesIO(contents), low_memory=False)
+        required = ['old_sku_id', 'UOM', 'cf']
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            return {"status": "error", "message": f"UOM master CSV missing required columns: {missing}. Required: old_sku_id, UOM, cf"}
+
+        df['cf'] = pd.to_numeric(df['cf'], errors='coerce').fillna(1).astype(int)
+
+        # Save to DB and rebuild lookup
+        save_uom_master_to_db(df)
+
+        # Update existing sku_profiles valid_uoms from the new UOM master
+        update_sku_profiles_valid_uoms_from_master()
+
+        # Persist updated profiles to DB
+        save_profiles_to_db(sku_profiles)
+
+        return {
+            "status": "success",
+            "message": f"UOM master uploaded: {row_count:,} rows processed. {len(uom_master_lookup)} SKUs in master.",
+            "sku_count": len(uom_master_lookup)
+        }
+
+    except Exception as e:
+        return {"status": "error", "message": f"Failed to process UOM master file: {str(e)}"}
+
+
 @app.get("/upload_status/{task_id}")
 def upload_status(task_id: str):
     """Poll this endpoint to check the status of an async upload.
@@ -1590,6 +1742,29 @@ def download_sales_template():
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=sales_template.csv"}
     )
+
+
+@app.get("/download_uom_master_template")
+def download_uom_master_template():
+    """Download an empty CSV template for UOM master data."""
+    columns = ['old_sku_id', 'listing_title', 'business_category', 'UOM', 'Flag', 'cf', 'uom_type']
+    template_df = pd.DataFrame(columns=columns)
+    csv_buffer = io.StringIO()
+    template_df.to_csv(csv_buffer, index=False)
+    return Response(
+        content=csv_buffer.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=uom_master_template.csv"}
+    )
+
+
+@app.get("/uom_master_status")
+def get_uom_master_status():
+    """Return the current UOM master status."""
+    return {
+        "loaded": len(uom_master_lookup) > 0,
+        "sku_count": len(uom_master_lookup)
+    }
 
 
 @app.get("/export_progress")
