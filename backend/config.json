@@ -1,11 +1,35 @@
 {
   "data_file_path": "../GRN Data Final last 1 year UOM Adjusted.csv",
-  "historical_data": {
-    "median_br_lower_multiplier": 0.6,
-    "median_br_upper_multiplier": 3.0
+  "grn_profiling": {
+    "base_rate_lower_multiplier": 0.3,
+    "base_rate_upper_multiplier": 3.0,
+    "website_override_lower_multiplier": 0.7,
+    "website_override_upper_multiplier": 1.5,
+    "min_rows_for_profile": 3
+  },
+  "outlier_detection": {
+    "statistical_lower_multiplier": 0.3,
+    "statistical_upper_multiplier": 3.0,
+    "website_lower_multiplier": 0.7,
+    "website_upper_multiplier": 1.5
+  },
+  "sales_analysis": {
+    "normalized_price_lower_multiplier": 0.6,
+    "normalized_price_upper_multiplier": 3.0
   },
   "prediction": {
     "acceptable_ratio_lower": 0.3,
     "acceptable_ratio_upper": 1.8
+  },
+  "website_price": {
+    "lower_multiplier": 0.7,
+    "upper_multiplier": 1.5
+  },
+  "confidence_scoring": {
+    "uom_master_source_weight": 0.9,
+    "website_source_weight": 0.9,
+    "grn_pattern_source_weight": 0.6,
+    "csv_fallback_source_weight": 0.3,
+    "minimum_confidence_for_auto_suggest": 0.6
   }
 }

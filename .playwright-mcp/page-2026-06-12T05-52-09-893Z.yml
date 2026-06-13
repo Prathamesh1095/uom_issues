@@ -1,0 +1,49 @@
+- generic [ref=e4]:
+  - generic [ref=e5]:
+    - heading "Smart GRN Entry" [level=1] [ref=e7]
+    - generic [ref=e8]:
+      - button "GRN Template" [disabled] [ref=e9]:
+        - img [ref=e10]
+        - generic [ref=e14]: GRN Template
+      - button "GRN Outliers" [disabled] [ref=e15]:
+        - img [ref=e16]
+        - generic [ref=e19]: GRN Outliers
+      - button "Sales Outliers" [disabled] [ref=e20]:
+        - img [ref=e21]
+        - generic [ref=e24]: Sales Outliers
+      - button "Loss Summary" [disabled] [ref=e25]:
+        - img [ref=e26]
+        - generic [ref=e29]: Loss Summary
+  - generic [ref=e30]:
+    - generic [ref=e31]:
+      - generic [ref=e32]: "Data Type:"
+      - generic [ref=e33]:
+        - button "PO / GRN Data" [ref=e34]
+        - button "Sales Data" [ref=e35]
+        - button "UOM Master" [ref=e36]
+    - generic [ref=e38]:
+      - generic [ref=e39] [cursor=pointer]:
+        - img [ref=e40]
+        - generic [ref=e44]: Select CSV File...
+      - button "Upload" [disabled] [ref=e45]:
+        - img [ref=e46]
+        - text: Upload
+  - generic [ref=e49]:
+    - generic [ref=e50]:
+      - generic [ref=e51]:
+        - generic [ref=e52]: SKU Code
+        - textbox "SKU Code" [ref=e53]:
+          - /placeholder: e.g. SKU12345
+      - generic [ref=e54]:
+        - generic [ref=e55]: Entered Price (Total)
+        - spinbutton "Entered Price (Total)" [ref=e56]
+    - separator [ref=e57]
+    - generic [ref=e58]:
+      - generic [ref=e59]:
+        - generic [ref=e60]: System UOM
+        - textbox "System UOM" [ref=e61]:
+          - /placeholder: Auto-filled
+      - generic [ref=e62]:
+        - generic [ref=e63]: System CF (Conversion Factor)
+        - textbox "System CF (Conversion Factor)" [ref=e64]:
+          - /placeholder: Auto-filled

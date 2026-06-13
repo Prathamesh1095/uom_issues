@@ -290,6 +290,8 @@ function App() {
   
   const [systemUom, setSystemUom] = useState('');
   const [systemCf, setSystemCf] = useState('');
+  const [systemConfidence, setSystemConfidence] = useState('');
+  const [predictionSource, setPredictionSource] = useState('');
   const [errorMsg, setErrorMsg] = useState('');
   
   const [flashGreen, setFlashGreen] = useState(false);
@@ -297,6 +299,7 @@ function App() {
   const [isExporting, setIsExporting] = useState(false);
   const [isExportingSales, setIsExportingSales] = useState(false);
   const [isExportingLoss, setIsExportingLoss] = useState(false);
+  const [isExportingSkuQuality, setIsExportingSkuQuality] = useState(false);
   
   const [selectedFile, setSelectedFile] = useState(null);
   const [fileType, setFileType] = useState('grn'); // 'grn', 'sales', or 'uom_master'
@@ -317,9 +320,14 @@ function App() {
   const [grnTemplateAvailable, setGrnTemplateAvailable] = useState(false);
   const [salesTemplateAvailable, setSalesTemplateAvailable] = useState(true);
 
+  // Quality analysis state
+  const [qualityResult, setQualityResult] = useState(null);
+  const [isAnalyzingQuality, setIsAnalyzingQuality] = useState(false);
+
   const debounceTimeout = useRef(null);
   const pollTimeout = useRef(null);
   const exportProgressTimeout = useRef(null);
+  const isPollingMounted = useRef(true);
 
   // Check server status on mount
   useEffect(() => {
@@ -409,7 +417,15 @@ function App() {
     }
   };
 
+  useEffect(() => {
+    return () => {
+      isPollingMounted.current = false;
+      if (pollTimeout.current) clearTimeout(pollTimeout.current);
+    };
+  }, []);
+
   const pollUploadStatus = useCallback((taskId) => {
+    isPollingMounted.current = true;
     const poll = async () => {
       try {
         const response = await axios.get(`${API_URL}/upload_status/${taskId}`);
@@ -423,15 +439,19 @@ function App() {
             text: data.message
           });
           setIsUploading(false);
-          
-          // Refresh sales summary if sales data was uploaded
+
           if (data.file_type === 'sales') {
             fetchSalesSummary();
+          }
+          if (data.file_type === 'uom_master') {
+            fetchUomMasterStatus();
           }
           return;
         }
 
-        pollTimeout.current = setTimeout(poll, 2000);
+        if (isPollingMounted.current) {
+          pollTimeout.current = setTimeout(poll, 2000);
+        }
       } catch (error) {
         console.error("Error polling upload status:", error);
         setUploadMsg({ type: 'error', text: 'Failed to check upload progress. The server may still be processing your file.' });
@@ -455,35 +475,27 @@ function App() {
       let response;
       
       if (fileType === 'uom_master') {
-        // UOM master upload is synchronous
         response = await axios.post(`${API_URL}/upload_uom_master`, formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
         });
-        
-        if (response.data.status === 'success') {
-          setUploadMsg({ type: 'success', text: response.data.message });
-          fetchUomMasterStatus();
-        } else {
-          setUploadMsg({ type: 'error', text: response.data.message });
-        }
-        setIsUploading(false);
       } else {
         formData.append('file_type', fileType);
         response = await axios.post(`${API_URL}/upload_data`, formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
         });
-        
-        if (response.data.status === 'success') {
-          setUploadMsg({ type: 'success', text: response.data.message });
-          setIsUploading(false);
-          if (fileType === 'sales') fetchSalesSummary();
-        } else if (response.data.status === 'accepted') {
-          setUploadMsg({ type: 'info', text: response.data.message });
-          pollUploadStatus(response.data.task_id);
-        } else {
-          setUploadMsg({ type: 'error', text: response.data.message });
-          setIsUploading(false);
-        }
+      }
+      
+      if (response.data.status === 'success') {
+        setUploadMsg({ type: 'success', text: response.data.message });
+        setIsUploading(false);
+        if (fileType === 'sales') fetchSalesSummary();
+        if (fileType === 'uom_master') fetchUomMasterStatus();
+      } else if (response.data.status === 'accepted') {
+        setUploadMsg({ type: 'info', text: response.data.message });
+        pollUploadStatus(response.data.task_id);
+      } else {
+        setUploadMsg({ type: 'error', text: response.data.message });
+        setIsUploading(false);
       }
     } catch (error) {
       console.error("Error uploading file:", error);
@@ -596,10 +608,71 @@ function App() {
     }
   };
 
+  const handleAnalyzeQuality = async () => {
+    if (!selectedFile) return;
+    const endpoint = fileType === 'sales' ? `${API_URL}/analyze_sales_quality` : `${API_URL}/analyze_grn_quality`;
+    setIsAnalyzingQuality(true);
+    setQualityResult(null);
+    try {
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+      const res = await axios.post(endpoint, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 120000,
+      });
+      setQualityResult({ type: 'success', data: res.data });
+    } catch (err) {
+      setQualityResult({ type: 'error', data: { message: 'Analysis request failed. Ensure file is valid CSV.' } });
+    } finally {
+      setIsAnalyzingQuality(false);
+    }
+  };
+
+  const handleExportCorrectionReport = async () => {
+    try {
+      const res = await axios.get(`${API_URL}/export_correction_report`, {
+        responseType: 'blob',
+      });
+      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', 'correction_report.xlsx');
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      alert('Failed to export correction report.');
+    }
+  };
+
+  const handleExportSkuQualityReport = async () => {
+    setIsExportingSkuQuality(true);
+    try {
+      const res = await axios.get(`${API_URL}/export_sku_quality_report`, {
+        responseType: 'blob',
+      });
+      const url = window.URL.createObjectURL(new Blob([res.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', 'sku_quality_report.xlsx');
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      alert('Failed to export SKU quality report.');
+    } finally {
+      setIsExportingSkuQuality(false);
+    }
+  };
+
   useEffect(() => {
     if (!skuCode || !inputPrice) {
       setSystemUom('');
       setSystemCf('');
+      setSystemConfidence('');
+      setPredictionSource('');
       setErrorMsg('');
       setFlashGreen(false);
       return;
@@ -617,18 +690,24 @@ function App() {
         if (data.status === 'success') {
           setSystemUom(data.uom);
           setSystemCf(data.cf);
+          setSystemConfidence(data.confidence ? `${(data.confidence * 100).toFixed(0)}%` : '');
+          setPredictionSource(data.alternatives && data.alternatives.length > 0 ? `${data.alternatives.length} alternatives` : '');
           setErrorMsg('');
           setFlashGreen(true);
           setTimeout(() => setFlashGreen(false), 2000);
         } else {
           setSystemUom('');
           setSystemCf('');
+          setSystemConfidence('');
+          setPredictionSource('');
           setErrorMsg(data.message || '⚠️ MANUAL REVIEW REQUIRED: The entered price drastically deviates from historical GRN data. Please verify your entry or escalate to a manager.');
           setFlashGreen(false);
         }
       } catch (err) {
         setSystemUom('');
         setSystemCf('');
+        setSystemConfidence('');
+        setPredictionSource('');
         setErrorMsg('⚠️ MANUAL REVIEW REQUIRED: The entered price drastically deviates from historical GRN data. Please verify your entry or escalate to a manager.');
         setFlashGreen(false);
       } finally {
@@ -670,7 +749,7 @@ function App() {
   const isTemplateDisabled = fileType === 'grn' ? !grnTemplateAvailable : fileType === 'sales' ? !salesTemplateAvailable : false;
 
   // Check if we're still initializing export progress
-  const isCheckingExports = grnOutliersProgress === -2;
+  const isCheckingExports = grnOutliersProgress === -2 || salesOutliersProgress === -2 || salesLossProgress === -2;
 
   return (
     <div className="min-h-screen bg-gray-50 flex items-start justify-center p-4 pt-8">
@@ -718,6 +797,11 @@ function App() {
                   <Download className="w-3.5 h-3.5 mr-1" />
                   <span>GRN Outliers {grnOutliersProgress}%</span>
                 </div>
+              ) : isCheckingExports ? (
+                <div className="flex items-center">
+                  <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin mr-1"></div>
+                  <span>Checking...</span>
+                </div>
               ) : (
                 <>
                   <Download className="w-3.5 h-3.5" />
@@ -743,6 +827,11 @@ function App() {
                 <div className="flex items-center">
                   <Download className="w-3.5 h-3.5 mr-1" />
                   <span>Sales Outliers {salesOutliersProgress}%</span>
+                </div>
+              ) : isCheckingExports ? (
+                <div className="flex items-center">
+                  <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin mr-1"></div>
+                  <span>Checking...</span>
                 </div>
               ) : (
                 <>
@@ -770,6 +859,11 @@ function App() {
                   <Download className="w-3.5 h-3.5 mr-1" />
                   <span>Loss Summary {salesLossProgress}%</span>
                 </div>
+              ) : isCheckingExports ? (
+                <div className="flex items-center">
+                  <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin mr-1"></div>
+                  <span>Checking...</span>
+                </div>
               ) : (
                 <>
                   <Download className="w-3.5 h-3.5" />
@@ -777,6 +871,52 @@ function App() {
                 </>
               )}
             </button>
+
+            {/* Quality Analysis Buttons */}
+            <div className="w-full border-t border-slate-700 pt-2 mt-2">
+              <div className="flex items-center space-x-2 mb-1.5">
+                <BarChart3 className="w-3.5 h-3.5 text-cyan-400" />
+                <span className="text-xs font-semibold text-cyan-300 uppercase tracking-wider">Quality Analysis</span>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={handleAnalyzeQuality}
+                  disabled={!selectedFile || isUploading || isAnalyzingQuality}
+                  className="flex items-center space-x-1.5 bg-cyan-700 hover:bg-cyan-600 disabled:bg-cyan-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+                >
+                  {isAnalyzingQuality ? (
+                    <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin mr-1"></div>
+                  ) : (
+                    <BarChart3 className="w-3.5 h-3.5 mr-1" />
+                  )}
+                  <span>Analyze {fileType === 'sales' ? 'Sales' : fileType === 'uom_master' ? 'UOM Master' : 'GRN'}</span>
+                </button>
+                <button
+                  onClick={handleExportCorrectionReport}
+                  className="flex items-center space-x-1.5 bg-slate-600 hover:bg-slate-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium transition-colors"
+                >
+                  <Download className="w-3.5 h-3.5 mr-1" />
+                  <span>Correction Report</span>
+                </button>
+                <button
+                  onClick={handleExportSkuQualityReport}
+                  disabled={isExportingSkuQuality}
+                  className={clsx(
+                    "flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors",
+                    isExportingSkuQuality
+                      ? "bg-rose-400 text-white cursor-not-allowed"
+                      : "bg-rose-700 hover:bg-rose-600 text-white"
+                  )}
+                >
+                  {isExportingSkuQuality ? (
+                    <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin mr-1"></div>
+                  ) : (
+                    <Download className="w-3.5 h-3.5 mr-1" />
+                  )}
+                  <span>SKU Quality Report</span>
+                </button>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -897,6 +1037,70 @@ function App() {
           )}
         </div>
 
+        {/* Quality Analysis Results */}
+        {qualityResult && (
+          <div className={clsx(
+            "px-6 py-4 border-b",
+            qualityResult.type === 'success'
+              ? "bg-cyan-50 border-cyan-100"
+              : "bg-red-50 border-red-100"
+          )}>
+            <div className="flex items-center space-x-2 mb-3">
+              <BarChart3 className={clsx("w-4 h-4", qualityResult.type === 'success' ? "text-cyan-600" : "text-red-600")} />
+              <h3 className={clsx("text-sm font-bold uppercase tracking-wider", qualityResult.type === 'success' ? "text-cyan-800" : "text-red-800")}>
+                {qualityResult.type === 'success' ? 'Quality Analysis Results' : 'Analysis Failed'}
+              </h3>
+              <button onClick={() => setQualityResult(null)} className="ml-auto text-xs text-gray-400 hover:text-gray-600">✕</button>
+            </div>
+            {qualityResult.type === 'success' && qualityResult.data ? (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div className="bg-white rounded-lg p-3 border border-cyan-100">
+                  <span className="text-xs font-medium text-cyan-600">Total Rows</span>
+                  <p className="text-lg font-bold text-gray-800">{(qualityResult.data.total_rows || 0).toLocaleString()}</p>
+                </div>
+                {(qualityResult.data.uom_master_cf_found !== undefined) && (
+                  <>
+                    <div className="bg-white rounded-lg p-3 border border-cyan-100">
+                      <span className="text-xs font-medium text-cyan-600">UOM Master CF</span>
+                      <p className="text-lg font-bold text-green-600">{(qualityResult.data.uom_master_cf_found || 0).toLocaleString()}</p>
+                    </div>
+                    <div className="bg-white rounded-lg p-3 border border-cyan-100">
+                      <span className="text-xs font-medium text-cyan-600">CF Missing</span>
+                      <p className="text-lg font-bold text-amber-600">{(qualityResult.data.uom_master_cf_missing || 0).toLocaleString()}</p>
+                    </div>
+                  </>
+                )}
+                {(qualityResult.data.flagged_count !== undefined) && (
+                  <div className="bg-white rounded-lg p-3 border border-cyan-100">
+                    <span className="text-xs font-medium text-cyan-600">Flagged Rows</span>
+                    <p className="text-lg font-bold text-amber-600">{(qualityResult.data.flagged_count || 0).toLocaleString()}</p>
+                  </div>
+                )}
+                <div className="bg-white rounded-lg p-3 border border-cyan-100">
+                  <span className="text-xs font-medium text-cyan-600">Corrections</span>
+                  <p className="text-lg font-bold text-red-600">{(qualityResult.data.corrections_recommended || 0).toLocaleString()}</p>
+                </div>
+                {(qualityResult.data.website_available_for !== undefined) && (
+                  <div className="bg-white rounded-lg p-3 border border-cyan-100">
+                    <span className="text-xs font-medium text-cyan-600">Website Cross-Check</span>
+                    <p className="text-lg font-bold text-gray-800">{(qualityResult.data.website_available_for || 0).toLocaleString()}</p>
+                  </div>
+                )}
+                {(qualityResult.data.total_sales_loss !== undefined) && (
+                  <div className="bg-white rounded-lg p-3 border border-cyan-100">
+                    <span className="text-xs font-medium text-cyan-600">Sales Loss (₹)</span>
+                    <p className="text-lg font-bold text-red-600">₹{(qualityResult.data.total_sales_loss || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 })}</p>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="bg-red-50 rounded-lg p-3 border border-red-200">
+                <p className="text-sm text-red-700">{qualityResult.data?.message || 'Analysis failed. Please try again.'}</p>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Sales Analysis Summary Card */}
         {salesSummary && salesSummary.has_sales_data && (
           <div className="bg-gradient-to-r from-emerald-50 to-teal-50 px-6 py-4 border-b border-emerald-100">
@@ -941,6 +1145,23 @@ function App() {
                 <p className="text-lg font-bold text-red-600">{formatCurrency(salesSummary.total_sales_loss)}</p>
               </div>
             </div>
+            {/* System Coverage Row */}
+            {(salesSummary.uom_master_sku_count !== undefined) && (
+              <div className="mt-3 grid grid-cols-3 gap-3">
+                <div className="bg-white/60 rounded-lg p-2 border border-emerald-100 text-center">
+                  <span className="text-xs text-emerald-500">UOM Master</span>
+                  <p className="text-sm font-bold text-gray-700">{(salesSummary.uom_master_sku_count || 0).toLocaleString()} SKUs</p>
+                </div>
+                <div className="bg-white/60 rounded-lg p-2 border border-emerald-100 text-center">
+                  <span className="text-xs text-emerald-500">Website Prices</span>
+                  <p className="text-sm font-bold text-gray-700">{(salesSummary.website_price_sku_count || 0).toLocaleString()} SKUs</p>
+                </div>
+                <div className="bg-white/60 rounded-lg p-2 border border-emerald-100 text-center">
+                  <span className="text-xs text-emerald-500">GRN Profiles</span>
+                  <p className="text-sm font-bold text-gray-700">{(salesSummary.grn_profile_sku_count || 0).toLocaleString()} SKUs</p>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -975,7 +1196,7 @@ function App() {
 
           <hr className="border-gray-100" />
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
             <div className="space-y-1.5">
               <label htmlFor="systemUom" className="block text-sm font-semibold text-gray-500">System UOM</label>
               <input
@@ -992,7 +1213,7 @@ function App() {
             </div>
 
             <div className="space-y-1.5">
-              <label htmlFor="systemCf" className="block text-sm font-semibold text-gray-500">System CF (Conversion Factor)</label>
+              <label htmlFor="systemCf" className="block text-sm font-semibold text-gray-500">System CF</label>
               <input
                 id="systemCf"
                 type="text"
@@ -1003,6 +1224,33 @@ function App() {
                   "w-full px-4 py-2.5 rounded-lg border bg-gray-50 text-gray-700 font-medium transition-all duration-300 outline-none cursor-not-allowed",
                   flashGreen ? "border-green-500 ring-4 ring-green-100" : "border-gray-200"
                 )}
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label htmlFor="systemConfidence" className="block text-sm font-semibold text-gray-500">Confidence</label>
+              <input
+                id="systemConfidence"
+                type="text"
+                readOnly
+                value={systemConfidence}
+                placeholder="—"
+                className={clsx(
+                  "w-full px-4 py-2.5 rounded-lg border bg-gray-50 text-gray-700 font-medium transition-all duration-300 outline-none cursor-not-allowed",
+                  flashGreen ? "border-green-500 ring-4 ring-green-100" : "border-gray-200"
+                )}
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label htmlFor="predictionSource" className="block text-sm font-semibold text-gray-500">Alternatives</label>
+              <input
+                id="predictionSource"
+                type="text"
+                readOnly
+                value={predictionSource}
+                placeholder="—"
+                className="w-full px-4 py-2.5 rounded-lg border border-gray-200 bg-gray-50 text-gray-500 font-medium outline-none cursor-not-allowed"
               />
             </div>
           </div>
